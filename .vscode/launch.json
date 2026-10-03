@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ShelfTabs}",
+            "name": "Debug ShelfTabs",
+            "target": "ShelfTabs",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug ShelfTabs"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ShelfTabs}",
+            "name": "Release ShelfTabs",
+            "target": "ShelfTabs",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release ShelfTabs"
+        }
+    ]
+}
