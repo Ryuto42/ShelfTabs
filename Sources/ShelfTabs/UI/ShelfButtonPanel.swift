@@ -256,6 +256,7 @@ final class ShelfButtonPanel: OverlayPanel {
     private let popup: ShelfPopupPanel
     private var buttonHovered = false
     private var closeWork: DispatchWorkItem?
+    private var pendingFrame: NSRect?
 
     init(shelfID: UUID) {
         self.shelfID = shelfID
@@ -294,13 +295,12 @@ final class ShelfButtonPanel: OverlayPanel {
         }
         let axRect = CGRect(x: centerX - size.width / 2, y: centerY - size.height / 2, width: size.width, height: size.height)
         let target = Geometry.nsRect(fromAX: axRect)
-        if self.frame != target {
+        if popup.isVisible, isVisible {
+            pendingFrame = target
+        } else if self.frame != target {
             setFrame(target, display: true)
         }
         present { order(.above, relativeTo: Int(windowID)) }
-        if popup.isVisible {
-            positionPopup()
-        }
     }
 
     func hide() {
@@ -340,6 +340,10 @@ final class ShelfButtonPanel: OverlayPanel {
         popup.popupView.isHovered = false
         popup.popOut()
         popup.dismiss(duration: 0.12)
+        if let pendingFrame {
+            self.pendingFrame = nil
+            setFrame(pendingFrame, display: true)
+        }
     }
 
     private func positionPopup() {

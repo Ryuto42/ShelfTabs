@@ -19,13 +19,14 @@
 
 ```sh
 swift build
-scripts/package.sh            # dist/ShelfTabs.app を作成
-open dist/ShelfTabs.app
+SIGN_IDENTITY="..." scripts/package.sh                # ビルドして /Applications/ShelfTabs.app にインストールし起動
+SIGN_IDENTITY="..." NO_INSTALL=1 scripts/package.sh   # インストールせず dist/ShelfTabs.app に出力
+swift scripts/generate-icon.swift /tmp/icon && iconutil -c icns /tmp/icon/AppIcon.iconset -o Resources/AppIcon.icns   # アイコン再生成
 ```
 
 初回起動時にアクセシビリティ権限を求められる。システム設定 > プライバシーとセキュリティ > アクセシビリティで許可する。キー入力の監視用に「入力監視」も求められることがある。
 
-キーチェーンに Apple Development 証明書があれば自動で使い、ビルドしてもアクセシビリティ権限が保持される。証明書がない場合は ad-hoc 署名になり、ビルドごとに権限がリセットされる。別の証明書を使うときは次のように指定する。
+署名 ID は環境変数 `SIGN_IDENTITY` で必ず指定する（未指定ならエラー）。Apple Development 証明書で署名すると、ビルドしてもアクセシビリティ権限が保持される。`SIGN_IDENTITY=-` で ad-hoc 署名にした場合は、ビルドごとに権限がリセットされる。バージョンは第1引数に `X.Y.Z` 形式で渡す（省略時は 0.1.0）。
 
 ```sh
 security find-identity -v -p codesigning

@@ -183,6 +183,14 @@ enum WindowList {
         }
     }
 
+    static func bounds(of id: CGWindowID) -> CGRect? {
+        var value = UnsafeRawPointer(bitPattern: UInt(id))
+        guard let array = CFArrayCreate(kCFAllocatorDefault, &value, 1, nil),
+              let list = CGWindowListCreateDescriptionFromArray(array) as? [[String: Any]],
+              let dict = list.first?[kCGWindowBounds as String] as? NSDictionary else { return nil }
+        return CGRect(dictionaryRepresentation: dict)
+    }
+
     static func isCandidate(_ info: WindowInfo) -> Bool {
         info.layer == 0
             && info.alpha > 0

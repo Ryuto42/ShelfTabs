@@ -1,3 +1,15 @@
 .build/
 dist/
 .DS_Store
+build/
+.swiftpm/
+xcuserdata/
+DerivedData/
+*.xcuserstate
+*.p12
+*.mobileprovision
+*.provisionprofile
+*.cer
+*.certSigningRequest
+Local.xcconfig
+.env

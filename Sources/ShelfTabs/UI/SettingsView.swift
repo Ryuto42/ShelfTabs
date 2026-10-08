@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import ServiceManagement
 import SwiftUI
 
 private final class KeyMonitor {
@@ -79,11 +80,22 @@ struct SettingsView: View {
     @AppStorage(AppSettings.Key.nextTabKeyCode) private var nextKeyCode = AppSettings.defaultNextTab.keyCode
     @AppStorage(AppSettings.Key.nextTabModifiers) private var nextModifiers = AppSettings.defaultNextTab.modifiers
     @State private var isTrusted = AXIsProcessTrusted()
+    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var loginItemError: String?
 
     private let permissionTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         Form {
+            Section("一般") {
+                Toggle("ログイン時に起動", isOn: Binding(get: { launchAtLogin }, set: setLaunchAtLogin))
+                if let loginItemError {
+                    Text(loginItemError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+
             Section("操作") {
                 Picker("合体用の修飾キー", selection: $mergeModifier) {
                     ForEach(MergeModifier.allCases) { Text($0.label).tag($0) }
@@ -133,5 +145,19 @@ struct SettingsView: View {
         .onReceive(permissionTimer) { _ in
             isTrusted = AXIsProcessTrusted()
         }
+    }
+
+    private func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            loginItemError = nil
+        } catch {
+            loginItemError = "設定できませんでした: \(error.localizedDescription)"
+        }
+        launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 }

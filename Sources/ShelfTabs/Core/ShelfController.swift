@@ -23,6 +23,7 @@ final class ShelfController: NSObject {
     private var dragSource: WindowInfo?
     private var dragTarget: WindowInfo?
     private var lastDragEvaluation: CFTimeInterval = 0
+    private var liveMoveShelf: UUID?
 
     func start() {
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)
@@ -84,7 +85,8 @@ final class ShelfController: NSObject {
     }
 
     func mouseDragged(at point: CGPoint, flags: CGEventFlags) {
-        guard dragSource != nil else { return }
+        guard let source = dragSource else { return }
+        followLiveMove(source.id)
         let now = CACurrentMediaTime()
         guard now - lastDragEvaluation >= 1.0 / 30.0 else { return }
         lastDragEvaluation = now
@@ -97,6 +99,11 @@ final class ShelfController: NSObject {
     }
 
     func mouseUp(flags: CGEventFlags) {
+        if let id = liveMoveShelf {
+            liveMoveShelf = nil
+            activeFrameChanged(id)
+            placeBar(id)
+        }
         let source = dragSource
         let target = dragTarget
         dragSource = nil
@@ -159,6 +166,9 @@ final class ShelfController: NSObject {
             if sourceIsNew { release(source.id) }
             if targetIsNew { release(target.id) }
             return
+        }
+        if sourceIsNew {
+            originalFrames[source.id] = source.bounds
         }
 
         let frame = AXWindow.frame(of: targetElement) ?? target.bounds
@@ -454,7 +464,9 @@ final class ShelfController: NSObject {
         let previous = shelfFrames[id]
         guard frame != previous else { return }
         shelfFrames[id] = frame
-        placeBar(id)
+        if liveMoveShelf != id {
+            placeBar(id)
+        }
         scheduleSync(id, sizeChanged: previous?.size != frame.size)
     }
 
@@ -546,11 +558,22 @@ final class ShelfController: NSObject {
         bar.update(name: shelf.name, accent: shelf.accent.color, tabs: tabs)
     }
 
-    private func placeBar(_ id: UUID) {
+    // Follows the window server's bounds during a user drag; AX move notifications arrive too late.
+    private func followLiveMove(_ windowID: CGWindowID) {
+        guard let shelf = store.shelf(containing: windowID), shelf.activeWindowID == windowID,
+              let bounds = WindowList.bounds(of: windowID) else { return }
+        if liveMoveShelf == nil {
+            guard bounds != shelfFrames[shelf.id] else { return }
+            liveMoveShelf = shelf.id
+        }
+        placeBar(shelf.id, frame: bounds)
+    }
+
+    private func placeBar(_ id: UUID, frame override: CGRect? = nil) {
         guard !hiddenBars.contains(id),
               let shelf = store.shelves[id],
               let bar = bars[id],
-              let frame = shelfFrames[id] else { return }
+              let frame = override ?? shelfFrames[id] else { return }
         let active = shelf.activeWindowID
         if lightsOffsets[active] == nil,
            let element = tracker.element(of: active),
