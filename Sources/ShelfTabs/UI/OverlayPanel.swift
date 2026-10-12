@@ -40,7 +40,7 @@ class OverlayPanel: NSPanel {
         }
     }
 
-    func dismiss(duration: TimeInterval = 0.15) {
+    func dismiss(duration: TimeInterval = 0.15, completion: (() -> Void)? = nil) {
         guard isVisible, !fadingOut else { return }
         fadingOut = true
         NSAnimationContext.runAnimationGroup({ context in
@@ -50,6 +50,7 @@ class OverlayPanel: NSPanel {
             guard let self, self.fadingOut else { return }
             self.fadingOut = false
             self.orderOut(nil)
+            completion?()
         })
     }
 }

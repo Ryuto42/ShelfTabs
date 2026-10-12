@@ -79,7 +79,7 @@ final class WindowAnimator: NSObject {
             let t = min((now - job.start) / Self.duration, 1)
             let eased = CGFloat(1 - pow(1 - t, 3))
 
-            if job.alphaFrom != job.alphaTo {
+            if job.alphaFrom != job.alphaTo, SkyLight.shared.isAlphaSupported {
                 SkyLight.shared.setAlpha(job.alphaFrom + (job.alphaTo - job.alphaFrom) * Float(eased), for: windowID)
             }
 

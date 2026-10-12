@@ -17,6 +17,7 @@ protocol ShelfButtonDelegate: AnyObject {
     func shelf(_ id: UUID, renameTo name: String)
     func shelf(_ id: UUID, setAccent accent: ShelfAccent)
     func shelfDissolve(_ id: UUID)
+    func shelfPopupWillOpen(_ id: UUID)
 }
 
 final class ShelfButtonView: NSView {
@@ -246,14 +247,14 @@ final class ShelfButtonPanel: OverlayPanel {
 
     let shelfID: UUID
     weak var shelfDelegate: ShelfButtonDelegate? {
-        didSet {
-            buttonView.delegate = shelfDelegate
-            popup.popupView.delegate = shelfDelegate
-        }
+        didSet { buttonView.delegate = shelfDelegate }
     }
 
+    var isPopupOpen: Bool { popup?.isVisible ?? false }
+
     private let buttonView: ShelfButtonView
-    private let popup: ShelfPopupPanel
+    private var popup: ShelfPopupPanel?
+    private var content: (name: String, accent: NSColor, tabs: [TabInfo]) = ("", .controlAccentColor, [])
     private var buttonHovered = false
     private var closeWork: DispatchWorkItem?
     private var pendingFrame: NSRect?
@@ -261,7 +262,6 @@ final class ShelfButtonPanel: OverlayPanel {
     init(shelfID: UUID) {
         self.shelfID = shelfID
         buttonView = ShelfButtonView(shelfID: shelfID)
-        popup = ShelfPopupPanel(shelfID: shelfID)
         super.init(size: Self.panelSize, level: .normal)
         contentView = buttonView
 
@@ -270,16 +270,27 @@ final class ShelfButtonPanel: OverlayPanel {
             self?.evaluatePopup()
         }
         buttonView.onContextMenu = { [weak self] in self?.closePopup() }
-        popup.popupView.onStateChange = { [weak self] in self?.evaluatePopup() }
-        popup.popupView.onDismissRequest = { [weak self] in self?.closePopup() }
     }
 
     func update(name: String, accent: NSColor, tabs: [TabInfo]) {
+        content = (name, accent, tabs)
         buttonView.update(name: name, accent: accent, tabIDs: tabs.map(\.windowID))
+        guard let popup else { return }
         popup.popupView.update(name: name, accent: accent, tabs: tabs)
         if popup.isVisible {
-            positionPopup()
+            positionPopup(popup)
         }
+    }
+
+    private func makePopup() -> ShelfPopupPanel {
+        if let popup { return popup }
+        let popup = ShelfPopupPanel(shelfID: shelfID)
+        popup.popupView.delegate = shelfDelegate
+        popup.popupView.onStateChange = { [weak self] in self?.evaluatePopup() }
+        popup.popupView.onDismissRequest = { [weak self] in self?.closePopup() }
+        popup.popupView.update(name: content.name, accent: content.accent, tabs: content.tabs)
+        self.popup = popup
+        return popup
     }
 
     func place(windowAXFrame frame: CGRect, trafficLights: CGRect?, above windowID: CGWindowID) {
@@ -295,7 +306,7 @@ final class ShelfButtonPanel: OverlayPanel {
         }
         let axRect = CGRect(x: centerX - size.width / 2, y: centerY - size.height / 2, width: size.width, height: size.height)
         let target = Geometry.nsRect(fromAX: axRect)
-        if popup.isVisible, isVisible {
+        if isPopupOpen, isVisible {
             pendingFrame = target
         } else if self.frame != target {
             setFrame(target, display: true)
@@ -312,12 +323,11 @@ final class ShelfButtonPanel: OverlayPanel {
     private func evaluatePopup() {
         closeWork?.cancel()
         closeWork = nil
-        let view = popup.popupView
         if buttonHovered {
             showPopup()
-        } else if view.isHovered || view.isBusy {
+        } else if let view = popup?.popupView, view.isHovered || view.isBusy {
             return
-        } else if popup.isVisible {
+        } else if isPopupOpen {
             let work = DispatchWorkItem { [weak self] in self?.closePopup() }
             closeWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.closeDelay, execute: work)
@@ -326,8 +336,12 @@ final class ShelfButtonPanel: OverlayPanel {
 
     private func showPopup() {
         guard isVisible else { return }
-        let appearing = !popup.isVisible
-        positionPopup()
+        let appearing = !isPopupOpen
+        if appearing {
+            shelfDelegate?.shelfPopupWillOpen(shelfID)
+        }
+        let popup = makePopup()
+        positionPopup(popup)
         popup.present(duration: 0.14) { popup.orderFrontRegardless() }
         if appearing {
             popup.popIn()
@@ -337,16 +351,21 @@ final class ShelfButtonPanel: OverlayPanel {
     private func closePopup() {
         closeWork?.cancel()
         closeWork = nil
-        popup.popupView.isHovered = false
-        popup.popOut()
-        popup.dismiss(duration: 0.12)
+        if let popup {
+            popup.popupView.isHovered = false
+            popup.popOut()
+            popup.dismiss(duration: 0.12) { [weak self] in
+                guard let self, let current = self.popup, current === popup, !current.isVisible else { return }
+                self.popup = nil
+            }
+        }
         if let pendingFrame {
             self.pendingFrame = nil
             setFrame(pendingFrame, display: true)
         }
     }
 
-    private func positionPopup() {
+    private func positionPopup(_ popup: ShelfPopupPanel) {
         let anchor = frame.insetBy(dx: Self.padding, dy: Self.padding)
         let size = NSSize(width: ShelfPopupView.width, height: popup.popupView.preferredHeight)
         var origin = NSPoint(x: anchor.minX, y: anchor.minY - Self.popupGap - size.height)

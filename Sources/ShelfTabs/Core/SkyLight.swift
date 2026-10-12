@@ -20,13 +20,18 @@ final class SkyLight {
         getAlphaFunction = dlsym(handle, "SLSGetWindowAlpha").map { unsafeBitCast($0, to: GetAlphaFunction.self) }
     }
 
+    // Recent macOS silently ignores alpha changes on other processes' windows; once seen, stop calling.
+    private(set) var isAlphaSupported = true
+
     @discardableResult
     func setAlpha(_ alpha: Float, for windowID: CGWindowID) -> Bool {
-        guard connectionID != 0, let setAlphaFunction else { return false }
+        guard isAlphaSupported, connectionID != 0, let setAlphaFunction else { return false }
         guard setAlphaFunction(connectionID, windowID, alpha) == 0 else { return false }
         guard let getAlphaFunction else { return true }
         var applied: Float = -1
         guard getAlphaFunction(connectionID, windowID, &applied) == 0 else { return true }
-        return abs(applied - alpha) < 0.01
+        if abs(applied - alpha) < 0.01 { return true }
+        isAlphaSupported = false
+        return false
     }
 }

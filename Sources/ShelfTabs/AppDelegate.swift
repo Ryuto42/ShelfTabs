@@ -48,7 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inputMonitor.onMouseDragged = { [controller] point, flags in controller.mouseDragged(at: point, flags: flags) }
         inputMonitor.onMouseUp = { [controller] flags in controller.mouseUp(flags: flags) }
         inputMonitor.onFlagsChanged = { [controller] flags in controller.flagsChanged(flags) }
-        inputMonitor.onShortcut = { [controller] delta in controller.handleShortcut(delta: delta) }
+        inputMonitor.onShortcut = { [controller] action in controller.handleShortcut(action) }
     }
 
     private func startMonitorRetry() {

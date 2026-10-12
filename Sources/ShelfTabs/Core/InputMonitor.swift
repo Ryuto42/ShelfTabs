@@ -1,20 +1,44 @@
 import AppKit
 
+enum ShortcutAction {
+    case previousTab
+    case nextTab
+    case layout(LayoutAction)
+}
+
+private struct ShortcutKey: Hashable {
+    let keyCode: Int
+    let modifiers: UInt
+}
+
 final class InputMonitor {
     var onMouseDown: ((CGPoint) -> Void)?
     var onMouseDragged: ((CGPoint, CGEventFlags) -> Void)?
     var onMouseUp: ((CGEventFlags) -> Void)?
     var onFlagsChanged: ((CGEventFlags) -> Void)?
-    var onShortcut: ((Int) -> Bool)?
+    var onShortcut: ((ShortcutAction) -> Bool)?
 
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+    private var shortcuts: [ShortcutKey: ShortcutAction] = [:]
+    private var defaultsObserver: NSObjectProtocol?
+
+    init() {
+        defaultsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.rebuildShortcuts() }
+    }
+
+    deinit {
+        if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
+    }
 
     var isRunning: Bool { tap != nil }
 
     @discardableResult
     func start() -> Bool {
         guard tap == nil else { return true }
+        rebuildShortcuts()
 
         let types: [CGEventType] = [.keyDown, .leftMouseDown, .leftMouseDragged, .leftMouseUp, .flagsChanged]
         let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
@@ -65,11 +89,28 @@ final class InputMonitor {
         case .flagsChanged:
             onFlagsChanged?(event.flags)
         case .keyDown:
-            if AppSettings.previousTab.matches(event), onShortcut?(-1) == true { return nil }
-            if AppSettings.nextTab.matches(event), onShortcut?(1) == true { return nil }
+            let key = ShortcutKey(
+                keyCode: Int(event.getIntegerValueField(.keyboardEventKeycode)),
+                modifiers: UInt(event.flags.rawValue) & Shortcut.relevantModifiers
+            )
+            if let action = shortcuts[key], onShortcut?(action) == true { return nil }
         default:
             break
         }
         return Unmanaged.passUnretained(event)
+    }
+
+    private func rebuildShortcuts() {
+        var result: [ShortcutKey: ShortcutAction] = [:]
+        func register(_ shortcut: Shortcut, _ action: ShortcutAction) {
+            guard shortcut.isAssigned else { return }
+            result[ShortcutKey(keyCode: shortcut.keyCode, modifiers: UInt(bitPattern: shortcut.modifiers) & Shortcut.relevantModifiers)] = action
+        }
+        for layout in LayoutAction.allCases {
+            register(AppSettings.shortcut(for: layout), .layout(layout))
+        }
+        register(AppSettings.previousTab, .previousTab)
+        register(AppSettings.nextTab, .nextTab)
+        shortcuts = result
     }
 }

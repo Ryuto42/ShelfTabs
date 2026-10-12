@@ -166,29 +166,35 @@ enum WindowList {
             ? [.optionOnScreenOnly, .excludeDesktopElements]
             : [.optionAll]
         guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return [] }
-        return list.compactMap { entry in
-            guard let id = entry[kCGWindowNumber as String] as? CGWindowID,
-                  let pid = entry[kCGWindowOwnerPID as String] as? pid_t,
-                  let boundsDict = entry[kCGWindowBounds as String] as? NSDictionary,
-                  let bounds = CGRect(dictionaryRepresentation: boundsDict) else { return nil }
-            return WindowInfo(
-                id: id,
-                pid: pid,
-                ownerName: entry[kCGWindowOwnerName as String] as? String ?? "",
-                bounds: bounds,
-                layer: entry[kCGWindowLayer as String] as? Int ?? 0,
-                alpha: entry[kCGWindowAlpha as String] as? Double ?? 1,
-                isOnScreen: entry[kCGWindowIsOnscreen as String] as? Bool ?? false
-            )
-        }
+        return list.compactMap(info(from:))
+    }
+
+    private static func info(from entry: [String: Any]) -> WindowInfo? {
+        guard let id = entry[kCGWindowNumber as String] as? CGWindowID,
+              let pid = entry[kCGWindowOwnerPID as String] as? pid_t,
+              let boundsDict = entry[kCGWindowBounds as String] as? NSDictionary,
+              let bounds = CGRect(dictionaryRepresentation: boundsDict) else { return nil }
+        return WindowInfo(
+            id: id,
+            pid: pid,
+            ownerName: entry[kCGWindowOwnerName as String] as? String ?? "",
+            bounds: bounds,
+            layer: entry[kCGWindowLayer as String] as? Int ?? 0,
+            alpha: entry[kCGWindowAlpha as String] as? Double ?? 1,
+            isOnScreen: entry[kCGWindowIsOnscreen as String] as? Bool ?? false
+        )
     }
 
     static func bounds(of id: CGWindowID) -> CGRect? {
-        var value = UnsafeRawPointer(bitPattern: UInt(id))
-        guard let array = CFArrayCreate(kCFAllocatorDefault, &value, 1, nil),
-              let list = CGWindowListCreateDescriptionFromArray(array) as? [[String: Any]],
-              let dict = list.first?[kCGWindowBounds as String] as? NSDictionary else { return nil }
-        return CGRect(dictionaryRepresentation: dict)
+        describe([id]).first?.bounds
+    }
+
+    static func describe(_ ids: [CGWindowID]) -> [WindowInfo] {
+        guard !ids.isEmpty else { return [] }
+        var values = ids.map { UnsafeRawPointer(bitPattern: UInt($0)) }
+        guard let array = CFArrayCreate(kCFAllocatorDefault, &values, values.count, nil),
+              let list = CGWindowListCreateDescriptionFromArray(array) as? [[String: Any]] else { return [] }
+        return list.compactMap(info(from:))
     }
 
     static func isCandidate(_ info: WindowInfo) -> Bool {
