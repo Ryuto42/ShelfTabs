@@ -1,9 +1,15 @@
 import AppKit
+import os
 
 enum ShortcutAction {
     case previousTab
     case nextTab
     case layout(LayoutAction)
+
+    var isTabSwitch: Bool {
+        if case .layout = self { return false }
+        return true
+    }
 }
 
 private struct ShortcutKey: Hashable {
@@ -11,16 +17,25 @@ private struct ShortcutKey: Hashable {
     let modifiers: UInt
 }
 
+// The tap runs on its own thread and never waits on AX or the main thread, so input is never delayed.
 final class InputMonitor {
     var onMouseDown: ((CGPoint) -> Void)?
     var onMouseDragged: ((CGPoint, CGEventFlags) -> Void)?
     var onMouseUp: ((CGEventFlags) -> Void)?
     var onFlagsChanged: ((CGEventFlags) -> Void)?
-    var onShortcut: ((ShortcutAction) -> Bool)?
+    var onShortcut: ((ShortcutAction) -> Void)?
 
+    private struct Snapshot {
+        var shortcuts: [ShortcutKey: ShortcutAction] = [:]
+        var shelfPIDs: Set<pid_t> = []
+        var frontmostPID: pid_t = 0
+        var tap: CFMachPort?
+        var runLoop: CFRunLoop?
+    }
+
+    private let ownPID = ProcessInfo.processInfo.processIdentifier
+    private let state = OSAllocatedUnfairLock(uncheckedState: Snapshot())
     private var tap: CFMachPort?
-    private var runLoopSource: CFRunLoopSource?
-    private var shortcuts: [ShortcutKey: ShortcutAction] = [:]
     private var defaultsObserver: NSObjectProtocol?
 
     init() {
@@ -31,14 +46,24 @@ final class InputMonitor {
 
     deinit {
         if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
+        stop()
     }
 
     var isRunning: Bool { tap != nil }
+
+    func update(shelfPIDs: Set<pid_t>) {
+        state.withLock { $0.shelfPIDs = shelfPIDs }
+    }
+
+    func update(frontmostPID: pid_t) {
+        state.withLock { $0.frontmostPID = frontmostPID }
+    }
 
     @discardableResult
     func start() -> Bool {
         guard tap == nil else { return true }
         rebuildShortcuts()
+        update(frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0)
 
         let types: [CGEventType] = [.keyDown, .leftMouseDown, .leftMouseDragged, .leftMouseUp, .flagsChanged]
         let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
@@ -57,43 +82,68 @@ final class InputMonitor {
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ), let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else { return false }
 
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
+        state.withLock { $0.tap = tap }
         self.tap = tap
-        runLoopSource = source
+        let thread = Thread { [state] in
+            let runLoop = CFRunLoopGetCurrent()
+            state.withLock { $0.runLoop = runLoop }
+            CFRunLoopAddSource(runLoop, source, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+            CFRunLoopRun()
+        }
+        thread.name = "ShelfTabs.InputMonitor"
+        thread.qualityOfService = .userInteractive
+        thread.start()
         return true
     }
 
     func stop() {
-        if let runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        let runLoop = state.withLock { snapshot in
+            snapshot.tap = nil
+            defer { snapshot.runLoop = nil }
+            return snapshot.runLoop
         }
         if let tap {
             CGEvent.tapEnable(tap: tap, enable: false)
             CFMachPortInvalidate(tap)
         }
-        runLoopSource = nil
+        if let runLoop {
+            CFRunLoopStop(runLoop)
+        }
         tap = nil
     }
 
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         switch type {
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
-            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            if let tap = state.withLock({ $0.tap }) { CGEvent.tapEnable(tap: tap, enable: true) }
         case .leftMouseDown:
-            onMouseDown?(event.location)
+            let location = event.location
+            DispatchQueue.main.async { self.onMouseDown?(location) }
         case .leftMouseDragged:
-            onMouseDragged?(event.location, event.flags)
+            let location = event.location
+            let flags = event.flags
+            DispatchQueue.main.async { self.onMouseDragged?(location, flags) }
         case .leftMouseUp:
-            onMouseUp?(event.flags)
+            let flags = event.flags
+            DispatchQueue.main.async { self.onMouseUp?(flags) }
         case .flagsChanged:
-            onFlagsChanged?(event.flags)
+            let flags = event.flags
+            DispatchQueue.main.async { self.onFlagsChanged?(flags) }
         case .keyDown:
             let key = ShortcutKey(
                 keyCode: Int(event.getIntegerValueField(.keyboardEventKeycode)),
                 modifiers: UInt(event.flags.rawValue) & Shortcut.relevantModifiers
             )
-            if let action = shortcuts[key], onShortcut?(action) == true { return nil }
+            let action: ShortcutAction? = state.withLock { snapshot in
+                guard let action = snapshot.shortcuts[key], snapshot.frontmostPID != ownPID else { return nil }
+                if action.isTabSwitch, !snapshot.shelfPIDs.contains(snapshot.frontmostPID) { return nil }
+                return action
+            }
+            if let action {
+                DispatchQueue.main.async { self.onShortcut?(action) }
+                return nil
+            }
         default:
             break
         }
@@ -111,6 +161,7 @@ final class InputMonitor {
         }
         register(AppSettings.previousTab, .previousTab)
         register(AppSettings.nextTab, .nextTab)
-        shortcuts = result
+        let shortcuts = result
+        state.withLock { $0.shortcuts = shortcuts }
     }
 }

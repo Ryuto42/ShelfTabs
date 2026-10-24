@@ -13,3 +13,12 @@ DerivedData/
 *.certSigningRequest
 Local.xcconfig
 .env
+*.p8
+*.pem
+*.key
+*ed25519*
+*private*key*
+*.dmg
+*.zip
+*.xcarchive
+.secrets/

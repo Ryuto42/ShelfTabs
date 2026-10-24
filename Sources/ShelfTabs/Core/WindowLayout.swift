@@ -11,26 +11,26 @@ enum LayoutAction: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .leftHalf: "左半分"
-        case .rightHalf: "右半分"
-        case .topHalf: "上半分"
-        case .bottomHalf: "下半分"
-        case .topLeft: "左上"
-        case .topRight: "右上"
-        case .bottomLeft: "左下"
-        case .bottomRight: "右下"
-        case .firstThird: "最初の1/3"
-        case .centerThird: "中央の1/3"
-        case .lastThird: "最後の1/3"
-        case .firstTwoThirds: "最初の2/3"
-        case .lastTwoThirds: "最後の2/3"
-        case .maximize: "最大化"
-        case .almostMaximize: "ほぼ最大化"
-        case .maximizeHeight: "縦に最大化"
-        case .center: "中央"
-        case .restore: "元に戻す"
-        case .nextDisplay: "次のディスプレイ"
-        case .previousDisplay: "前のディスプレイ"
+        case .leftHalf: loc("左半分")
+        case .rightHalf: loc("右半分")
+        case .topHalf: loc("上半分")
+        case .bottomHalf: loc("下半分")
+        case .topLeft: loc("左上")
+        case .topRight: loc("右上")
+        case .bottomLeft: loc("左下")
+        case .bottomRight: loc("右下")
+        case .firstThird: loc("最初の1/3")
+        case .centerThird: loc("中央の1/3")
+        case .lastThird: loc("最後の1/3")
+        case .firstTwoThirds: loc("最初の2/3")
+        case .lastTwoThirds: loc("最後の2/3")
+        case .maximize: loc("最大化")
+        case .almostMaximize: loc("ほぼ最大化")
+        case .maximizeHeight: loc("縦に最大化")
+        case .center: loc("中央")
+        case .restore: loc("元に戻す")
+        case .nextDisplay: loc("次のディスプレイ")
+        case .previousDisplay: loc("前のディスプレイ")
         }
     }
 

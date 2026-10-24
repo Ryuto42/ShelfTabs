@@ -2,10 +2,14 @@ import AppKit
 
 struct TabInfo {
     let windowID: CGWindowID
+    let memberID: CGWindowID
     let title: String
     let appName: String
     let icon: NSImage?
     let isActive: Bool
+
+    // A non-selected native tab: it moves with its window group and cannot be detached on its own.
+    var isSynthetic: Bool { windowID != memberID }
 }
 
 class HoverRowView: NSView {
@@ -15,12 +19,12 @@ class HoverRowView: NSView {
     var accent: NSColor = .controlAccentColor
     var highContrast = false
     private(set) var isHovered = false
-    private var trackingArea: NSTrackingArea?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.cornerRadius = 6
+        addHoverTrackingArea()
     }
 
     required init?(coder: NSCoder) {
@@ -30,18 +34,6 @@ class HoverRowView: NSView {
     override var mouseDownCanMoveWindow: Bool { false }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingArea { removeTrackingArea(trackingArea) }
-        let area = NSTrackingArea(
-            rect: .zero,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self
-        )
-        addTrackingArea(area)
-        trackingArea = area
-    }
 
     override func mouseEntered(with event: NSEvent) {
         setHovered(true)
@@ -85,11 +77,11 @@ final class ShelfAddRowView: HoverRowView {
     var onClick: (() -> Void)?
 
     private let iconView = NSImageView()
-    private let label = NSTextField(labelWithString: "ウィンドウを追加")
+    private let label = NSTextField(labelWithString: loc("ウィンドウを追加"))
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        iconView.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "ウィンドウを追加")?
+        iconView.image = NSImage(systemSymbolName: "plus", accessibilityDescription: loc("ウィンドウを追加"))?
             .withSymbolConfiguration(.init(pointSize: 11, weight: .semibold))
         iconView.contentTintColor = .secondaryLabelColor
         addSubview(iconView)
@@ -126,11 +118,11 @@ final class ReorderHandleView: NSView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        imageView.image = NSImage(systemSymbolName: "line.3.horizontal", accessibilityDescription: "並べ替え")?
+        imageView.image = NSImage(systemSymbolName: "line.3.horizontal", accessibilityDescription: loc("並べ替え"))?
             .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
         imageView.contentTintColor = .secondaryLabelColor
         addSubview(imageView)
-        toolTip = "ドラッグで並べ替え"
+        toolTip = loc("ドラッグで並べ替え")
     }
 
     required init?(coder: NSCoder) {
@@ -196,7 +188,7 @@ final class ShelfRowView: HoverRowView, NSDraggingSource {
         addSubview(titleLabel)
 
         closeButton.isBordered = false
-        closeButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "タブを分離")?
+        closeButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: loc("タブを分離"))?
             .withSymbolConfiguration(.init(pointSize: 8, weight: .bold))
         closeButton.contentTintColor = .secondaryLabelColor
         closeButton.imagePosition = .imageOnly
@@ -232,6 +224,7 @@ final class ShelfRowView: HoverRowView, NSDraggingSource {
         highContrast = style == .solid(highContrast: true)
 
         iconView.image = info.icon
+        closeButton.isHidden = !isHovered || isReordering || info.isSynthetic
         toolTip = info.title.isEmpty ? info.appName : "\(info.title) — \(info.appName)"
         updateTitle()
         applyColors()
@@ -251,7 +244,7 @@ final class ShelfRowView: HoverRowView, NSDraggingSource {
     }
 
     override func hoverChanged() {
-        closeButton.isHidden = !isHovered || isReordering
+        closeButton.isHidden = !isHovered || isReordering || info?.isSynthetic == true
         handle.isHidden = !(isHovered || isReordering)
         needsLayout = true
         hoverSelectWork?.cancel()
@@ -276,6 +269,7 @@ final class ShelfRowView: HoverRowView, NSDraggingSource {
               hypot(event.locationInWindow.x - down.locationInWindow.x,
                     event.locationInWindow.y - down.locationInWindow.y) > 4 else { return }
         mouseDownEvent = nil
+        guard info?.isSynthetic != true else { return }
 
         let pasteboardItem = NSPasteboardItem()
         pasteboardItem.setString(String(windowID), forType: Self.pasteboardType)

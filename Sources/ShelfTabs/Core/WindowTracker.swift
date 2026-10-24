@@ -7,6 +7,7 @@ final class WindowTracker {
     }
 
     var onEvent: ((Event, CGWindowID) -> Void)?
+    var onUnwatchedFocus: ((CGWindowID, AXUIElement) -> Void)?
 
     private struct Entry {
         let pid: pid_t
@@ -82,7 +83,11 @@ final class WindowTracker {
 
         let windowID = AXWindow.id(of: element)
             ?? entries.first { CFEqual($0.value.element, element) }?.key
-        guard let windowID, entries[windowID] != nil else { return }
+        guard let windowID else { return }
+        guard entries[windowID] != nil else {
+            if event == .focused { onUnwatchedFocus?(windowID, element) }
+            return
+        }
         onEvent?(event, windowID)
     }
 

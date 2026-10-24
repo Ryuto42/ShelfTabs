@@ -9,17 +9,23 @@ enum ExternalDock {
         case shown(edge: ExternalDockEdge, thickness: CGFloat)
     }
 
+    private typealias Area = (edge: ExternalDockEdge, inset: CGFloat, autoHide: Bool)
+
     private static let cacheLifetime: TimeInterval = 0.5
     private static let rescanInterval: TimeInterval = 3
     private static let minimumSize: CGFloat = 16
+    private static let maxPublishedAreas = 32
+    private static let notificationInterval: TimeInterval = 0.2
 
     private static var cache: [String: (time: TimeInterval, status: Status)] = [:]
     private static var windowIDs: [CGWindowID] = []
     private static var windowPID: pid_t?
     private static var lastScan: TimeInterval = -.infinity
-    private static var published: [String: (edge: ExternalDockEdge, inset: CGFloat, autoHide: Bool)]?
+    private static var published: [String: Area]?
     private static var publishedBundleID: String?
-    private static var publishedObserver: NSObjectProtocol?
+    private static var publishedObserver: (name: Notification.Name, token: NSObjectProtocol)?
+    private static var lastNotification: TimeInterval = -.infinity
+    private static var notificationPending = false
     private static var rememberedEdges: [String: String] = UserDefaults.standard.dictionary(forKey: AppSettings.Key.externalDockEdges) as? [String: String] ?? [:]
 
     static func usableFrame(for screen: NSScreen) -> CGRect {
@@ -55,7 +61,7 @@ enum ExternalDock {
         let bundleID = AppSettings.externalDockBundleID
         if !bundleID.isEmpty, NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty { return .notRunning }
         if let areas = publishedAreas() {
-            guard let area = areas[screenID(for: screen)] else { return .none }
+            guard let area = displayNumber(of: screen).flatMap({ areas["\($0)"] }) else { return .none }
             return area.autoHide
                 ? .hidden(edge: area.edge, margin: AppSettings.externalDockHiddenMargin)
                 : .shown(edge: area.edge, thickness: area.inset)
@@ -74,44 +80,83 @@ enum ExternalDock {
         UserDefaults.standard.removeObject(forKey: AppSettings.Key.externalDockEdges)
     }
 
-    private static func screenID(for screen: NSScreen) -> String {
-        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber).map { "\($0)" } ?? screen.localizedName
-    }
-
-    private static func publishedAreas() -> [String: (edge: ExternalDockEdge, inset: CGFloat, autoHide: Bool)]? {
+    static var appName: String? {
         let bundleID = AppSettings.externalDockBundleID
         guard !bundleID.isEmpty else { return nil }
-        if publishedObserver == nil {
-            publishedObserver = DistributedNotificationCenter.default().addObserver(
-                forName: Notification.Name("com.ryuto.GlassDock.reservedAreasChanged"), object: nil, queue: .main
-            ) { _ in
-                publishedBundleID = nil
-                cache = [:]
-            }
+        return NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.localizedName
+    }
+
+    private static func displayNumber(of screen: NSScreen) -> CGDirectDisplayID? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+    }
+
+    private static func displayKey(for screen: NSScreen) -> String {
+        guard let number = displayNumber(of: screen),
+              let uuid = CGDisplayCreateUUIDFromDisplayID(number)?.takeRetainedValue(),
+              let string = CFUUIDCreateString(nil, uuid) as String? else { return screen.localizedName }
+        return string
+    }
+
+    // The dock app may announce changes to its published areas; listen under a name derived from its bundle id.
+    private static func observePublished(bundleID: String) {
+        let name = Notification.Name("\(bundleID).reservedAreasChanged")
+        guard publishedObserver?.name != name else { return }
+        if let token = publishedObserver?.token {
+            DistributedNotificationCenter.default().removeObserver(token)
         }
+        let token = DistributedNotificationCenter.default().addObserver(forName: name, object: nil, queue: .main) { _ in
+            publishedAreasChanged()
+        }
+        publishedObserver = (name, token)
+    }
+
+    private static func publishedAreasChanged() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let wait = lastNotification + notificationInterval - now
+        guard wait > 0 else {
+            lastNotification = now
+            publishedBundleID = nil
+            cache = [:]
+            return
+        }
+        guard !notificationPending else { return }
+        notificationPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
+            notificationPending = false
+            publishedAreasChanged()
+        }
+    }
+
+    private static func publishedAreas() -> [String: Area]? {
+        let bundleID = AppSettings.externalDockBundleID
+        guard !bundleID.isEmpty else { return nil }
+        observePublished(bundleID: bundleID)
         if publishedBundleID == bundleID { return published }
 
         CFPreferencesAppSynchronize(bundleID as CFString)
-        var parsed: [String: (edge: ExternalDockEdge, inset: CGFloat, autoHide: Bool)]?
-        if let raw = CFPreferencesCopyAppValue("reservedAreas" as CFString, bundleID as CFString) as? [String: [String: Any]] {
-            var areas: [String: (edge: ExternalDockEdge, inset: CGFloat, autoHide: Bool)] = [:]
-            for (id, entry) in raw {
-                guard let edge = (entry["edge"] as? String).flatMap(ExternalDockEdge.init(rawValue:)) else { continue }
-                areas[id] = (edge, CGFloat((entry["inset"] as? NSNumber)?.doubleValue ?? 0), (entry["autoHide"] as? NSNumber)?.boolValue ?? false)
-            }
-            parsed = areas
-        }
+        let parsed = CFPreferencesCopyAppValue("reservedAreas" as CFString, bundleID as CFString)
+            .flatMap { $0 as? [String: Any] }
+            .map(parseAreas)
         published = parsed
         publishedBundleID = bundleID
         cache = [:]
         return parsed
     }
 
-    private static func displayKey(for screen: NSScreen) -> String {
-        guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
-              let uuid = CGDisplayCreateUUIDFromDisplayID(number.uint32Value)?.takeRetainedValue(),
-              let string = CFUUIDCreateString(nil, uuid) as String? else { return screen.localizedName }
-        return string
+    // Data written by another app: accept only well-formed, finite, in-range values.
+    private static func parseAreas(_ raw: [String: Any]) -> [String: Area] {
+        let limit = NSScreen.screens.map { max($0.frame.width, $0.frame.height) }.max() ?? 0
+        var areas: [String: Area] = [:]
+        for (id, value) in raw.sorted(by: { $0.key < $1.key }) {
+            guard areas.count < maxPublishedAreas, id.count <= 64,
+                  let entry = value as? [String: Any],
+                  let edge = (entry["edge"] as? String).flatMap(ExternalDockEdge.init(rawValue:)) else { continue }
+            let inset = (entry["inset"] as? NSNumber)?.doubleValue ?? 0
+            guard inset.isFinite else { continue }
+            let autoHide = (entry["autoHide"] as? NSNumber)?.boolValue ?? false
+            areas[id] = (edge, CGFloat(min(max(inset, 0), Double(limit))), autoHide)
+        }
+        return areas
     }
 
     private static func detect(on screen: NSScreen, key: String, now: TimeInterval, fresh: Bool) -> Status {

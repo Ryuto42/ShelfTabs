@@ -22,16 +22,30 @@ final class SkyLight {
 
     // Recent macOS silently ignores alpha changes on other processes' windows; once seen, stop calling.
     private(set) var isAlphaSupported = true
+    private(set) var dimmedWindows: Set<CGWindowID> = []
 
     @discardableResult
     func setAlpha(_ alpha: Float, for windowID: CGWindowID) -> Bool {
         guard isAlphaSupported, connectionID != 0, let setAlphaFunction else { return false }
         guard setAlphaFunction(connectionID, windowID, alpha) == 0 else { return false }
+        if alpha < 1 {
+            dimmedWindows.insert(windowID)
+        } else {
+            dimmedWindows.remove(windowID)
+        }
         guard let getAlphaFunction else { return true }
         var applied: Float = -1
         guard getAlphaFunction(connectionID, windowID, &applied) == 0 else { return true }
         if abs(applied - alpha) < 0.01 { return true }
         isAlphaSupported = false
+        dimmedWindows.removeAll()
         return false
+    }
+
+    func resetAllAlpha() {
+        for windowID in dimmedWindows {
+            setAlpha(1, for: windowID)
+        }
+        dimmedWindows.removeAll()
     }
 }

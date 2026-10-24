@@ -36,9 +36,7 @@ final class ShelfPopupView: NSView {
     private var tabs: [TabInfo] = []
     private var name = ""
     private var accent: NSColor = .controlAccentColor
-    private var trackingArea: NSTrackingArea?
-    private var defaultsObserver: NSObjectProtocol?
-    private var accessibilityObserver: NSObjectProtocol?
+    private var styleObserver: NSObjectProtocol?
 
     init(shelfID: UUID) {
         self.shelfID = shelfID
@@ -56,11 +54,9 @@ final class ShelfPopupView: NSView {
         addRow.onClick = { [weak self] in self?.showAddMenu() }
         background.content.addSubview(addRow)
 
-        defaultsObserver = NotificationCenter.default.addObserver(
-            forName: UserDefaults.didChangeNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.refreshStyle() }
-        accessibilityObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
+        addHoverTrackingArea()
+        styleObserver = NotificationCenter.default.addObserver(
+            forName: .shelfStyleDidChange, object: nil, queue: .main
         ) { [weak self] _ in self?.refreshStyle() }
     }
 
@@ -69,8 +65,7 @@ final class ShelfPopupView: NSView {
     }
 
     deinit {
-        if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
-        if let accessibilityObserver { NSWorkspace.shared.notificationCenter.removeObserver(accessibilityObserver) }
+        if let styleObserver { NotificationCenter.default.removeObserver(styleObserver) }
     }
 
     override var mouseDownCanMoveWindow: Bool { false }
@@ -96,6 +91,10 @@ final class ShelfPopupView: NSView {
         for (windowID, row) in rows where !currentIDs.contains(windowID) {
             row.removeFromSuperview()
             rows.removeValue(forKey: windowID)
+        }
+        if let reorderingID, !currentIDs.contains(reorderingID) {
+            self.reorderingID = nil
+            isBusy = false
         }
         for tab in tabs where rows[tab.windowID] == nil {
             let row = ShelfRowView(windowID: tab.windowID)
@@ -199,19 +198,13 @@ final class ShelfPopupView: NSView {
             layoutSubtreeIfNeeded()
         }
         isBusy = false
-        delegate?.shelf(shelfID, reorder: tabs.map(\.windowID))
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingArea { removeTrackingArea(trackingArea) }
-        let area = NSTrackingArea(
-            rect: .zero,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self
-        )
-        addTrackingArea(area)
-        trackingArea = area
+        let moved = tabs.first { $0.windowID == windowID }?.memberID
+        var order: [CGWindowID] = []
+        for tab in tabs where !order.contains(tab.memberID) {
+            if tab.memberID == moved, tab.windowID != windowID { continue }
+            order.append(tab.memberID)
+        }
+        delegate?.shelf(shelfID, reorder: order)
     }
 
     override func mouseEntered(with event: NSEvent) {
@@ -262,7 +255,7 @@ final class ShelfPopupView: NSView {
         let menu = NSMenu()
         let candidates = delegate?.shelfCandidateWindows(shelfID) ?? []
         if candidates.isEmpty {
-            let empty = NSMenuItem(title: "追加できるウィンドウがありません", action: nil, keyEquivalent: "")
+            let empty = NSMenuItem(title: loc("追加できるウィンドウがありません"), action: nil, keyEquivalent: "")
             empty.isEnabled = false
             menu.addItem(empty)
         }
@@ -291,6 +284,7 @@ final class ShelfPopupView: NSView {
 
 final class ShelfPopupPanel: OverlayPanel {
     let popupView: ShelfPopupView
+    var opensUpward = false
 
     init(shelfID: UUID) {
         popupView = ShelfPopupView(shelfID: shelfID)
@@ -329,11 +323,13 @@ final class ShelfPopupPanel: OverlayPanel {
         layer.add(shrink, forKey: "pop")
     }
 
+    // Shrinks toward the edge facing the pill: the top when opening downward, the bottom when upward.
     private func collapsedTransform(scale: CGFloat, lift: CGFloat) -> CATransform3D {
         let height = popupView.bounds.height
+        let offset = opensUpward ? -lift : height * (1 - scale) + lift
         return CATransform3DConcat(
             CATransform3DMakeScale(scale, scale, 1),
-            CATransform3DMakeTranslation(0, height * (1 - scale) + lift, 0)
+            CATransform3DMakeTranslation(0, offset, 0)
         )
     }
 }

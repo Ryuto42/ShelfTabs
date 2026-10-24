@@ -25,13 +25,14 @@ struct ShortcutRecorderView: View {
     var clearable = false
 
     @State private var isRecording = false
+    @State private var isDuplicated = false
     @State private var keyMonitor = KeyMonitor()
 
     var body: some View {
-        LabeledContent(title) {
+        LabeledContent {
             HStack(spacing: 8) {
                 Button(action: toggleRecording) {
-                    Text(isRecording ? "キーを押してください…" : Shortcut(keyCode: keyCode, modifiers: modifiers).displayString)
+                    Text(isRecording ? loc("キーを押してください…") : Shortcut(keyCode: keyCode, modifiers: modifiers).displayString)
                         .font(.system(.body, design: .monospaced))
                         .frame(minWidth: 110)
                 }
@@ -49,8 +50,23 @@ struct ShortcutRecorderView: View {
                     modifiers = defaultShortcut.modifiers
                 }
             }
+        } label: {
+            Text(title)
+            if isDuplicated {
+                Label("他のショートカットと重複しています", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            }
         }
+        .onAppear(perform: checkDuplicate)
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in checkDuplicate() }
         .onDisappear(perform: stopRecording)
+    }
+
+    private func checkDuplicate() {
+        let duplicated = AppSettings.isDuplicated(Shortcut(keyCode: keyCode, modifiers: modifiers))
+        if duplicated != isDuplicated {
+            isDuplicated = duplicated
+        }
     }
 
     private func toggleRecording() {
@@ -127,9 +143,11 @@ private struct SnapAreaPicker: View {
 }
 
 struct SettingsView: View {
+    let updater: UpdateController
+
     var body: some View {
         TabView {
-            GeneralSettingsView()
+            GeneralSettingsView(updater: updater)
                 .tabItem { Label("一般", systemImage: "gearshape") }
             TabSettingsView()
                 .tabItem { Label("タブ", systemImage: "rectangle.stack") }
@@ -143,6 +161,7 @@ struct SettingsView: View {
 }
 
 private struct GeneralSettingsView: View {
+    @Bindable var updater: UpdateController
     @AppStorage(AppSettings.Key.styleMode) private var styleMode = StyleMode.auto
     @AppStorage(AppSettings.Key.glassVariant) private var glassVariant = GlassVariant.regular
     @AppStorage(AppSettings.Key.themeMode) private var themeMode = ThemeMode.system
@@ -176,9 +195,20 @@ private struct GeneralSettingsView: View {
                 }
             }
 
+            Section("アップデート") {
+                Toggle("自動的にアップデートを確認", isOn: $updater.automaticallyChecks)
+                    .disabled(!UpdateController.isConfigured)
+                LabeledContent("バージョン", value: UpdateController.version)
+                if !UpdateController.isConfigured {
+                    Text("このビルドでは自動アップデートが無効です")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Section("アクセシビリティ権限") {
                 LabeledContent("状態") {
-                    Label(isTrusted ? "許可済み" : "未許可", systemImage: isTrusted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    Label(isTrusted ? loc("許可済み") : loc("未許可"), systemImage: isTrusted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                         .foregroundStyle(isTrusted ? .green : .orange)
                 }
                 Button("システム設定を開く") {
@@ -203,7 +233,7 @@ private struct GeneralSettingsView: View {
             }
             loginItemError = nil
         } catch {
-            loginItemError = "設定できませんでした: \(error.localizedDescription)"
+            loginItemError = loc("設定できませんでした: %@", error.localizedDescription)
         }
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
@@ -211,6 +241,8 @@ private struct GeneralSettingsView: View {
 
 private struct TabSettingsView: View {
     @AppStorage(AppSettings.Key.mergeModifier) private var mergeModifier = MergeModifier.shift
+    @AppStorage(AppSettings.Key.nativeTabsForNewWindows) private var nativeTabsForNewWindows = true
+    @AppStorage(AppSettings.Key.hoverNativeTabs) private var hoverNativeTabs = true
     @AppStorage(AppSettings.Key.previousTabKeyCode) private var previousKeyCode = AppSettings.defaultPreviousTab.keyCode
     @AppStorage(AppSettings.Key.previousTabModifiers) private var previousModifiers = AppSettings.defaultPreviousTab.modifiers
     @AppStorage(AppSettings.Key.nextTabKeyCode) private var nextKeyCode = AppSettings.defaultNextTab.keyCode
@@ -218,18 +250,23 @@ private struct TabSettingsView: View {
 
     var body: some View {
         Form {
+            Section("Finder・プレビュー") {
+                Toggle("新しいウインドウを既存のウインドウのタブで開く", isOn: $nativeTabsForNewWindows)
+                Toggle("タブにポインタを置くと切り替える", isOn: $hoverNativeTabs)
+            }
+
             Section("操作") {
                 Picker("合体用の修飾キー", selection: $mergeModifier) {
                     ForEach(MergeModifier.allCases) { Text($0.label).tag($0) }
                 }
                 ShortcutRecorderView(
-                    title: "前のタブ",
+                    title: loc("前のタブ"),
                     keyCode: $previousKeyCode,
                     modifiers: $previousModifiers,
                     defaultShortcut: AppSettings.defaultPreviousTab
                 )
                 ShortcutRecorderView(
-                    title: "次のタブ",
+                    title: loc("次のタブ"),
                     keyCode: $nextKeyCode,
                     modifiers: $nextModifiers,
                     defaultShortcut: AppSettings.defaultNextTab
@@ -318,13 +355,13 @@ private struct ExternalDockSection: View {
                 Text("なし").tag("")
                 ForEach(apps, id: \.id) { Text($0.name).tag($0.id) }
             }
-            Stepper(value: $shownMargin, in: 0...60, step: 1) {
-                LabeledContent("表示中の追加余白", value: "\(Int(shownMargin)) pt")
+            Stepper(value: $shownMargin, in: AppSettings.shownMarginRange, step: 1) {
+                LabeledContent("表示中の追加余白", value: "\(Int(AppSettings.clamped(shownMargin, to: AppSettings.shownMarginRange))) pt")
             }
             .disabled(bundleID.isEmpty)
             VStack(alignment: .leading, spacing: 2) {
-                Stepper(value: $hiddenMargin, in: 0...120, step: 1) {
-                    LabeledContent("隠れているときの余白", value: "\(Int(hiddenMargin)) pt")
+                Stepper(value: $hiddenMargin, in: AppSettings.hiddenMarginRange, step: 1) {
+                    LabeledContent("隠れているときの余白", value: "\(Int(AppSettings.clamped(hiddenMargin, to: AppSettings.hiddenMarginRange))) pt")
                 }
                 Text("自動的に隠れるDockで、隠れている間も空けておく幅です")
                     .font(.caption)
@@ -365,18 +402,19 @@ private struct ExternalDockSection: View {
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
 
         usesPublished = ExternalDock.usesPublishedData
+        let source = ExternalDock.appName ?? bundleID
         statuses = NSScreen.screens.map { screen in
             let text: String
             switch ExternalDock.status(for: screen, fresh: true) {
             case .notConfigured: text = ""
-            case .notRunning: text = "起動していません"
-            case .none: text = "Dockなし"
+            case .notRunning: text = loc("起動していません")
+            case .none: text = loc("Dockなし")
             case .hidden(let edge, let margin):
-                text = usesPublished ? "GlassDock から取得：自動的に隠す（\(edge.label)端に \(Int(margin.rounded())) pt 空ける）"
-                    : "非表示（\(edge.label)端に \(Int(margin.rounded())) pt 空ける）"
+                text = usesPublished ? loc("%@ から取得：自動的に隠す（%@端に %d pt 空ける）", source, edge.label, Int(margin.rounded()))
+                    : loc("非表示（%@端に %d pt 空ける）", edge.label, Int(margin.rounded()))
             case .shown(let edge, let thickness):
-                text = usesPublished ? "GlassDock から取得：表示中 \(edge.label)端 \(Int(thickness.rounded())) pt"
-                    : "表示中：\(edge.label)端 \(Int(thickness.rounded())) pt"
+                text = usesPublished ? loc("%@ から取得：表示中 %@端 %d pt", source, edge.label, Int(thickness.rounded()))
+                    : loc("表示中：%@端 %d pt", edge.label, Int(thickness.rounded()))
             }
             return (screen.localizedName, text)
         }

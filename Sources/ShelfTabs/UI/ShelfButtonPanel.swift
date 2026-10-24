@@ -31,21 +31,17 @@ final class ShelfButtonView: NSView {
     private var tabIDs: Set<CGWindowID> = []
     private var name = ""
     private var accent: NSColor = .controlAccentColor
-    private var trackingArea: NSTrackingArea?
-    private var defaultsObserver: NSObjectProtocol?
-    private var accessibilityObserver: NSObjectProtocol?
+    private var styleObserver: NSObjectProtocol?
 
     init(shelfID: UUID) {
         self.shelfID = shelfID
         super.init(frame: .zero)
         rebuildPill()
         registerForDraggedTypes([ShelfRowView.pasteboardType])
+        addHoverTrackingArea()
 
-        defaultsObserver = NotificationCenter.default.addObserver(
-            forName: UserDefaults.didChangeNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.refreshStyle() }
-        accessibilityObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
+        styleObserver = NotificationCenter.default.addObserver(
+            forName: .shelfStyleDidChange, object: nil, queue: .main
         ) { [weak self] _ in self?.refreshStyle() }
     }
 
@@ -54,8 +50,7 @@ final class ShelfButtonView: NSView {
     }
 
     deinit {
-        if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
-        if let accessibilityObserver { NSWorkspace.shared.notificationCenter.removeObserver(accessibilityObserver) }
+        if let styleObserver { NotificationCenter.default.removeObserver(styleObserver) }
     }
 
     override var mouseDownCanMoveWindow: Bool { false }
@@ -82,6 +77,7 @@ final class ShelfButtonView: NSView {
     }
 
     private func refreshStyle() {
+        window?.appearance = AppSettings.themeMode.appearance
         let newStyle = BarStyle.resolve()
         guard newStyle != style else { return }
         style = newStyle
@@ -124,18 +120,6 @@ final class ShelfButtonView: NSView {
         }
     }
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingArea { removeTrackingArea(trackingArea) }
-        let area = NSTrackingArea(
-            rect: .zero,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self
-        )
-        addTrackingArea(area)
-        trackingArea = area
-    }
-
     override func mouseEntered(with event: NSEvent) {
         onHoverChanged?(true)
     }
@@ -152,11 +136,11 @@ final class ShelfButtonView: NSView {
     private func makeContextMenu() -> NSMenu {
         let menu = NSMenu()
 
-        let rename = NSMenuItem(title: "名前を変更…", action: #selector(renameChosen), keyEquivalent: "")
+        let rename = NSMenuItem(title: loc("名前を変更…"), action: #selector(renameChosen), keyEquivalent: "")
         rename.target = self
         menu.addItem(rename)
 
-        let accentItem = NSMenuItem(title: "アクセントカラー", action: nil, keyEquivalent: "")
+        let accentItem = NSMenuItem(title: loc("アクセントカラー"), action: nil, keyEquivalent: "")
         let accentMenu = NSMenu()
         let currentAccent = ShelfAccent.allCases.first { $0.color == accent }
         for preset in ShelfAccent.allCases {
@@ -172,7 +156,7 @@ final class ShelfButtonView: NSView {
 
         menu.addItem(.separator())
 
-        let dissolve = NSMenuItem(title: "棚を解散", action: #selector(dissolveChosen), keyEquivalent: "")
+        let dissolve = NSMenuItem(title: loc("棚を解散"), action: #selector(dissolveChosen), keyEquivalent: "")
         dissolve.target = self
         menu.addItem(dissolve)
         return menu
@@ -181,14 +165,14 @@ final class ShelfButtonView: NSView {
     @objc private func renameChosen() {
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
         field.stringValue = name
-        field.placeholderString = "棚の名前"
+        field.placeholderString = loc("棚の名前")
 
         let alert = NSAlert()
-        alert.messageText = "棚の名前を変更"
-        alert.informativeText = "空にすると名前なしになります。"
+        alert.messageText = loc("棚の名前を変更")
+        alert.informativeText = loc("空にすると名前なしになります。")
         alert.accessoryView = field
         alert.addButton(withTitle: "OK")
-        alert.addButton(withTitle: "キャンセル")
+        alert.addButton(withTitle: loc("キャンセル"))
         alert.window.initialFirstResponder = field
 
         NSApp.activate()
@@ -221,13 +205,14 @@ final class ShelfButtonView: NSView {
         draggingUpdated(sender)
     }
 
+    // A row dropped back on its own shelf's pill is accepted as a no-op so it is not detached.
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard let windowID = draggedWindowID(sender), !tabIDs.contains(windowID) else { return [] }
-        return .move
+        draggedWindowID(sender) == nil ? [] : .move
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        guard let windowID = draggedWindowID(sender), !tabIDs.contains(windowID) else { return false }
+        guard let windowID = draggedWindowID(sender) else { return false }
+        guard !tabIDs.contains(windowID) else { return true }
         DispatchQueue.main.async { self.delegate?.shelf(self.shelfID, dropWindow: windowID) }
         return true
     }
@@ -263,6 +248,7 @@ final class ShelfButtonPanel: OverlayPanel {
         self.shelfID = shelfID
         buttonView = ShelfButtonView(shelfID: shelfID)
         super.init(size: Self.panelSize, level: .normal)
+        appearance = AppSettings.themeMode.appearance
         contentView = buttonView
 
         buttonView.onHoverChanged = { [weak self] hovered in
@@ -337,13 +323,14 @@ final class ShelfButtonPanel: OverlayPanel {
     private func showPopup() {
         guard isVisible else { return }
         let appearing = !isPopupOpen
+        let reviving = popup?.isFadingOut == true
         if appearing {
             shelfDelegate?.shelfPopupWillOpen(shelfID)
         }
         let popup = makePopup()
         positionPopup(popup)
         popup.present(duration: 0.14) { popup.orderFrontRegardless() }
-        if appearing {
+        if appearing || reviving {
             popup.popIn()
         }
     }
@@ -369,10 +356,15 @@ final class ShelfButtonPanel: OverlayPanel {
         let anchor = frame.insetBy(dx: Self.padding, dy: Self.padding)
         let size = NSSize(width: ShelfPopupView.width, height: popup.popupView.preferredHeight)
         var origin = NSPoint(x: anchor.minX, y: anchor.minY - Self.popupGap - size.height)
+        var upward = false
         if let visible = (screen ?? NSScreen.main)?.visibleFrame {
             origin.x = min(max(origin.x, visible.minX), visible.maxX - size.width)
-            origin.y = max(origin.y, visible.minY)
+            if origin.y < visible.minY {
+                upward = anchor.maxY + Self.popupGap + size.height <= visible.maxY
+                origin.y = upward ? anchor.maxY + Self.popupGap : visible.minY
+            }
         }
+        popup.opensUpward = upward
         let target = NSRect(origin: origin, size: size)
         if popup.frame != target {
             popup.setFrame(target, display: true)

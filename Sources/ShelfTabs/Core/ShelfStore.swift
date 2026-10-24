@@ -5,14 +5,14 @@ enum ShelfAccent: Int, CaseIterable {
 
     var label: String {
         switch self {
-        case .blue: "ブルー"
-        case .purple: "パープル"
-        case .pink: "ピンク"
-        case .red: "レッド"
-        case .orange: "オレンジ"
-        case .yellow: "イエロー"
-        case .green: "グリーン"
-        case .gray: "グレー"
+        case .blue: loc("ブルー")
+        case .purple: loc("パープル")
+        case .pink: loc("ピンク")
+        case .red: loc("レッド")
+        case .orange: loc("オレンジ")
+        case .yellow: loc("イエロー")
+        case .green: loc("グリーン")
+        case .gray: loc("グレー")
         }
     }
 
@@ -133,6 +133,14 @@ final class ShelfStore {
         shelves[id]?.activeIndex = index
     }
 
+    func replace(_ old: CGWindowID, with new: CGWindowID) {
+        guard old != new, membership[new] == nil, let id = membership[old],
+              let index = shelves[id]?.windowIDs.firstIndex(of: old) else { return }
+        shelves[id]?.windowIDs[index] = new
+        membership.removeValue(forKey: old)
+        membership[new] = id
+    }
+
     func step(from windowID: CGWindowID, by delta: Int) -> CGWindowID? {
         guard let shelf = shelf(containing: windowID),
               let index = shelf.windowIDs.firstIndex(of: windowID) else { return nil }
@@ -141,7 +149,7 @@ final class ShelfStore {
     }
 
     func reorder(_ shelfID: UUID, to order: [CGWindowID]) {
-        guard let shelf = shelves[shelfID], Set(order) == Set(shelf.windowIDs),
+        guard let shelf = shelves[shelfID], order.count == shelf.windowIDs.count, Set(order) == Set(shelf.windowIDs),
               let index = order.firstIndex(of: shelf.activeWindowID) else { return }
         shelves[shelfID]?.windowIDs = order
         shelves[shelfID]?.activeIndex = index

@@ -1,69 +1,119 @@
 import AppKit
 
+struct NativeTab {
+    let title: String
+    let selected: Bool
+}
+
+struct MemberState {
+    var originalFrame: CGRect?
+    var title = ""
+    var lightsOffset: CGRect?
+    var hidden = false
+    var parked = false
+    var tabBarEnsured = false
+    var tabBarAttempts = 0
+    var nativeTabs: [NativeTab]?
+}
+
+enum BarHiddenReason {
+    case state, poll
+}
+
+struct SnapRecord {
+    var restore: CGRect
+    var snapped: CGRect
+}
+
 final class ShelfController: NSObject {
-    private let store = ShelfStore()
-    private let tracker = WindowTracker()
-    private let highlight = DropHighlightPanel()
-    private let snapPreview = DropHighlightPanel()
-    private let animator = WindowAnimator()
-    private let ownPID = ProcessInfo.processInfo.processIdentifier
+    let store = ShelfStore()
+    let tracker = WindowTracker()
+    let highlight = DropHighlightPanel(color: .systemBlue)
+    let snapPreview = DropHighlightPanel(color: .systemGray)
+    let animator = WindowAnimator()
+    let nativeWatcher = NativeWindowWatcher()
+    let nativeHover = NativeTabHover()
+    let journal = ParkedJournal()
+    let ownPID = ProcessInfo.processInfo.processIdentifier
 
-    private var bars: [UUID: ShelfButtonPanel] = [:]
-    private var hiddenBars: Set<UUID> = []
-    private var pollHiddenBars: Set<UUID> = []
-    private var minimizedShelves: Set<UUID> = []
-    private var shelfFrames: [UUID: CGRect] = [:]
-    private var originalFrames: [CGWindowID: CGRect] = [:]
-    private var titles: [CGWindowID: String] = [:]
-    private var lightsOffsets: [CGWindowID: CGRect] = [:]
-    private var hidden: Set<CGWindowID> = []
-    private var parked: Set<CGWindowID> = []
-    private var pendingSync: [UUID: Bool] = [:]
-    private var ignoreFocusUntil = Date.distantPast
-    private var pollTimer: Timer?
+    var onShelfPIDsChanged: ((Set<pid_t>) -> Void)?
 
-    private var dragSource: WindowInfo?
-    private var dragTarget: WindowInfo?
-    private var lastDragEvaluation: CFTimeInterval = 0
-    private var liveMoveShelf: UUID?
-
-    private struct SnapRecord {
-        var restore: CGRect
-        var snapped: CGRect
+    var members: [CGWindowID: MemberState] = [:] {
+        didSet { scheduleStateCheck() }
     }
+    var shelfFrames: [UUID: CGRect] = [:]
+    var bars: [UUID: ShelfButtonPanel] = [:]
+    var barHidden: [UUID: BarHiddenReason] = [:]
+    var minimizedShelves: Set<UUID> = []
+    var syntheticTabs: [CGWindowID: (member: CGWindowID, index: Int)] = [:]
+    var pendingSync: [UUID: Bool] = [:]
+    var ignoreFocusUntil = Date.distantPast
+    var pollTimer: Timer?
 
-    private var snapRecords: [CGWindowID: SnapRecord] = [:]
-    private var dragMoved = false
-    private var snapAction: LayoutAction?
-    private var snapVisible = CGRect.zero
-    private var snapFrame: CGRect?
-    private var snapBottomEntry: Int?
+    var nativeMergeMinimized: Set<CGWindowID> = []
+    var pendingNativeWindows: [pid_t: [AXUIElement]] = [:]
+    var pendingNativeWork: [pid_t: DispatchWorkItem] = [:]
+    var nativeMergeTails: [pid_t: (token: Int, task: Task<Void, Never>)] = [:]
+    var nativeMergeToken = 0
+
+    var dragSource: WindowInfo?
+    var dragTarget: WindowInfo?
+    var dragMoved = false
+    var lastDragEvaluation: CFTimeInterval = 0
+    var liveMoveShelf: UUID?
+    var snapRecords: [CGWindowID: SnapRecord] = [:]
+    var snapAction: LayoutAction?
+    var snapVisible = CGRect.zero
+    var snapFrame: CGRect?
+    var snapBottomEntry: Int?
+
+    private var stateCheckScheduled = false
+    private var publishedPIDs: Set<pid_t> = []
+    private var journaledIDs: Set<CGWindowID> = []
 
     func start() {
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)
         tracker.onEvent = { [weak self] event, windowID in self?.handle(event, windowID) }
+        tracker.onUnwatchedFocus = { [weak self] windowID, element in self?.unwatchedWindowFocused(windowID, element: element) }
+        nativeWatcher.onWindowCreated = { [weak self] element, pid, mousePressed in
+            // A window made while dragging is a tab the user pulled out on purpose.
+            guard !mousePressed else { return }
+            self?.queueNativeWindow(element, pid: pid)
+        }
+        accessibilityGranted()
 
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(self, selector: #selector(applicationTerminated(_:)), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
         center.addObserver(self, selector: #selector(applicationActivated(_:)), name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        center.addObserver(self, selector: #selector(applicationHidden(_:)), name: NSWorkspace.didHideApplicationNotification, object: nil)
+        center.addObserver(self, selector: #selector(applicationUnhidden(_:)), name: NSWorkspace.didUnhideApplicationNotification, object: nil)
         center.addObserver(self, selector: #selector(spaceChanged), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil
+        )
+    }
+
+    func accessibilityGranted() {
+        guard AXIsProcessTrusted() else { return }
+        nativeWatcher.start()
+        nativeHover.update(frontmost: NSWorkspace.shared.frontmostApplication)
+        journal.recover()
     }
 
     func restoreAll() {
         animator.cancelAll()
         for shelf in store.shelves.values {
+            let shelfFrame = shelfFrames[shelf.id]
             for windowID in shelf.windowIDs {
-                guard let element = tracker.element(of: windowID),
-                      let frame = originalFrames[windowID],
-                      Geometry.intersectsAnyScreen(axRect: frame) else { continue }
-                AXWindow.setFrame(frame, of: element)
+                guard let element = tracker.element(of: windowID) else { continue }
+                let original = members[windowID]?.originalFrame.flatMap { Geometry.intersectsAnyScreen(axRect: $0) ? $0 : nil }
+                let target = original ?? shelfFrame ?? AXWindow.frame(of: element).map(Geometry.clampedIntoVisibleScreen)
+                if let target {
+                    AXWindow.setFrame(target, of: element)
+                }
             }
         }
-        if SkyLight.shared.isAlphaSupported {
-            for info in WindowList.copy(onScreenOnly: false) where info.layer == 0 && info.pid != ownPID {
-                SkyLight.shared.setAlpha(1, for: info.id)
-            }
-        }
+        SkyLight.shared.resetAllAlpha()
         for id in Array(store.shelves.keys) {
             _ = store.dissolve(id)
         }
@@ -73,430 +123,81 @@ final class ShelfController: NSObject {
         tracker.unwatchAll()
         updatePolling()
         shelfFrames.removeAll()
-        originalFrames.removeAll()
-        titles.removeAll()
+        members.removeAll()
         minimizedShelves.removeAll()
-        lightsOffsets.removeAll()
-        hidden.removeAll()
-        parked.removeAll()
+        syntheticTabs.removeAll()
         pendingSync.removeAll()
         highlight.hide()
         clearSnap()
         snapRecords.removeAll()
+        journal.recover()
+        checkState()
+        journal.flush()
     }
 
-    // MARK: - Input
+    // MARK: - Shared state
 
-    func mouseDown(at point: CGPoint) {
-        dragTarget = nil
-        dragSource = nil
-        dragMoved = false
-        clearSnap()
-        for info in WindowList.copy(onScreenOnly: true) where info.bounds.contains(point) {
-            if info.pid == ownPID { return }
-            if WindowList.isCandidate(info) {
-                dragSource = info
-                return
-            }
-        }
+    private func scheduleStateCheck() {
+        guard !stateCheckScheduled else { return }
+        stateCheckScheduled = true
+        DispatchQueue.main.async { [weak self] in self?.checkState() }
     }
 
-    func mouseDragged(at point: CGPoint, flags: CGEventFlags) {
-        guard let source = dragSource else { return }
-        followLiveMove(source.id)
-        let now = CACurrentMediaTime()
-        guard now - lastDragEvaluation >= 1.0 / 30.0 else { return }
-        lastDragEvaluation = now
-        updateDropTarget(at: point, flags: flags)
-    }
-
-    func flagsChanged(_ flags: CGEventFlags) {
-        guard dragSource != nil else { return }
-        updateDropTarget(at: Geometry.axPoint(fromNS: NSEvent.mouseLocation), flags: flags)
-    }
-
-    func mouseUp(flags: CGEventFlags) {
-        if let id = liveMoveShelf {
-            liveMoveShelf = nil
-            activeFrameChanged(id)
-            placeBar(id)
-        }
-        let source = dragSource
-        let target = dragTarget
-        let snap = snapAction
-        let snapVisible = snapVisible
-        dragSource = nil
-        dragTarget = nil
-        dragMoved = false
-        highlight.hide()
-        clearSnap()
-
-        if let source, let snap {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [self] in
-                snapDragged(source: source, action: snap, visible: snapVisible)
-            }
-        } else if let source, let target {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [self] in
-                mergeDragged(source: source, target: target)
-            }
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [self] in
-            raiseBars()
-        }
-    }
-
-    func handleShortcut(_ action: ShortcutAction) -> Bool {
-        switch action {
-        case .previousTab: return stepTab(by: -1)
-        case .nextTab: return stepTab(by: 1)
-        case .layout(let layout): return perform(layout)
-        }
-    }
-
-    private func stepTab(by delta: Int) -> Bool {
-        guard let app = NSWorkspace.shared.frontmostApplication,
-              app.processIdentifier != ownPID,
-              let windowID = AXWindow.focusedWindowID(pid: app.processIdentifier),
-              let next = store.step(from: windowID, by: delta) else { return false }
-        switchTo(next)
-        return true
-    }
-
-    private func updateDropTarget(at point: CGPoint, flags: CGEventFlags) {
-        guard let source = dragSource else { return }
-        if !dragMoved, let bounds = WindowList.bounds(of: source.id), bounds.origin != source.bounds.origin {
-            dragMoved = true
-            restoreSizeIfUnsnapped(source, bounds: bounds, cursor: point)
-        }
-        if dragMoved, updateSnap(at: point, source: source) { return }
-
-        let modifier = flags.contains(AppSettings.mergeModifier.flag)
-        guard modifier || dragMoved else {
-            setDropTarget(nil)
-            return
-        }
-        let excluded = Set(store.shelf(containing: source.id)?.windowIDs ?? [source.id])
-        var target = WindowList.copy(onScreenOnly: true).first {
-            WindowList.isCandidate($0) && $0.bounds.contains(point) && !excluded.contains($0.id)
-        }
-        if let candidate = target, !modifier, !(dragMoved && Self.mergeZone(of: candidate.bounds).contains(point)) {
-            target = nil
-        }
-        setDropTarget(target)
-    }
-
-    private func setDropTarget(_ target: WindowInfo?) {
-        guard target?.id != dragTarget?.id else { return }
-        dragTarget = target
-        if let target {
-            highlight.show(axFrame: target.bounds)
-        } else {
-            highlight.hide()
-        }
-    }
-
-    // MARK: - Snap
-
-    private func updateSnap(at point: CGPoint, source: WindowInfo) -> Bool {
-        guard AppSettings.snapEnabled,
-              let (area, screen) = Self.snapArea(at: point),
-              let action = snapAction(for: area, at: point, screenFrame: Geometry.axRect(fromNS: screen.frame)),
-              case let visible = ExternalDock.usableFrame(for: screen),
-              let frame = WindowLayout.frame(for: action, current: source.bounds, visible: visible) else {
-            clearSnap()
-            return false
-        }
-        if area != .bottom { snapBottomEntry = nil }
-        let appeared = snapAction == nil
-        snapAction = action
-        snapVisible = visible
-        setDropTarget(nil)
-        if frame != snapFrame {
-            snapFrame = frame
-            snapPreview.show(axFrame: frame)
-        }
-        if appeared, AppSettings.snapHaptics {
-            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
-        }
-        return true
-    }
-
-    private func clearSnap() {
-        snapBottomEntry = nil
-        guard snapAction != nil else { return }
-        snapAction = nil
-        snapFrame = nil
-        snapPreview.hide()
-    }
-
-    private func snapAction(for area: SnapArea, at point: CGPoint, screenFrame: CGRect) -> LayoutAction? {
-        let choice = AppSettings.snapChoice(for: area)
-        if choice == SnapArea.thirds, area == .bottom {
-            let third = min(2, max(0, Int((point.x - screenFrame.minX) / screenFrame.width * 3)))
-            let entry = snapBottomEntry ?? third
-            snapBottomEntry = entry
-            switch (entry, third) {
-            case (0, 1): return .firstTwoThirds
-            case (2, 1): return .lastTwoThirds
-            case (_, 0): return .firstThird
-            case (_, 1): return .centerThird
-            default: return .lastThird
-            }
-        }
-        return LayoutAction(rawValue: choice).flatMap { $0.isSnappable ? $0 : nil }
-    }
-
-    private static func snapArea(at point: CGPoint) -> (SnapArea, NSScreen)? {
-        let screens = NSScreen.screens
-        let frames = screens.map { Geometry.axRect(fromNS: $0.frame) }
-        guard let index = frames.firstIndex(where: { $0.contains(point) })
-                ?? frames.firstIndex(where: { $0.insetBy(dx: -1, dy: -1).contains(point) }) else { return nil }
-        let f = frames[index]
-        let others = frames.enumerated().filter { $0.offset != index }.map(\.element)
-        func adjacent(_ p: CGPoint) -> Bool { others.contains { $0.contains(p) } }
-
-        let edge: CGFloat = 5
-        let corner: CGFloat = 20
-        let left = point.x < f.minX + edge && !adjacent(CGPoint(x: f.minX - 1, y: point.y))
-        let right = point.x >= f.maxX - edge && !adjacent(CGPoint(x: f.maxX + 1, y: point.y))
-        let top = point.y < f.minY + edge && !adjacent(CGPoint(x: point.x, y: f.minY - 1))
-        let bottom = point.y >= f.maxY - edge && !adjacent(CGPoint(x: point.x, y: f.maxY + 1))
-        let nearLeft = point.x < f.minX + corner
-        let nearRight = point.x >= f.maxX - corner
-        let nearTop = point.y < f.minY + corner
-        let nearBottom = point.y >= f.maxY - corner
-
-        let area: SnapArea
-        if (top && nearLeft) || (left && nearTop) {
-            area = .topLeftCorner
-        } else if (top && nearRight) || (right && nearTop) {
-            area = .topRightCorner
-        } else if (bottom && nearLeft) || (left && nearBottom) {
-            area = .bottomLeftCorner
-        } else if (bottom && nearRight) || (right && nearBottom) {
-            area = .bottomRightCorner
-        } else if top {
-            area = .top
-        } else if left {
-            area = .left
-        } else if right {
-            area = .right
-        } else if bottom {
-            area = .bottom
-        } else {
-            return nil
-        }
-        return (area, screens[index])
-    }
-
-    private func restoreSizeIfUnsnapped(_ source: WindowInfo, bounds: CGRect, cursor: CGPoint) {
-        guard AppSettings.snapRestoreSize,
-              let record = snapRecords[source.id],
-              Self.approximatelyEqual(source.bounds, record.snapped),
-              let element = tracker.element(of: source.id) ?? AXWindow.element(pid: source.pid, id: source.id) else { return }
-        snapRecords.removeValue(forKey: source.id)
-        let size = record.restore.size
-        guard size != bounds.size, bounds.width > 0 else { return }
-        let relativeX = (cursor.x - bounds.minX) / bounds.width
-        animator.cancel(source.id)
-        AXWindow.setSize(size, of: element)
-        AXWindow.setPosition(CGPoint(x: (cursor.x - relativeX * size.width).rounded(), y: bounds.minY), of: element)
-    }
-
-    private static func approximatelyEqual(_ a: CGRect, _ b: CGRect, tolerance: CGFloat = 2) -> Bool {
-        abs(a.minX - b.minX) <= tolerance && abs(a.minY - b.minY) <= tolerance
-            && abs(a.width - b.width) <= tolerance && abs(a.height - b.height) <= tolerance
-    }
-
-    private func snapDragged(source: WindowInfo, action: LayoutAction, visible: CGRect) {
-        guard let element = tracker.element(of: source.id) ?? AXWindow.element(pid: source.pid, id: source.id),
-              let current = AXWindow.frame(of: element),
-              let frame = WindowLayout.frame(for: action, current: current, visible: visible) else { return }
-        applyLayout(windowID: source.id, element: element, frame: frame)
-    }
-
-    private func perform(_ action: LayoutAction) -> Bool {
-        guard let app = NSWorkspace.shared.frontmostApplication,
-              app.processIdentifier != ownPID,
-              let focusedID = AXWindow.focusedWindowID(pid: app.processIdentifier),
-              let focusedElement = tracker.element(of: focusedID) ?? AXWindow.element(pid: app.processIdentifier, id: focusedID),
-              !AXWindow.isFullScreen(focusedElement) else { return false }
-        let (windowID, element) = layoutTarget(windowID: focusedID, element: focusedElement)
-        guard let current = AXWindow.frame(of: element) else { return false }
-
-        if action == .restore {
-            guard let record = snapRecords.removeValue(forKey: windowID) else { return false }
-            applyLayout(windowID: windowID, element: element, frame: record.restore, recordSnap: false)
-            return true
-        }
-        guard let frame = action.targetFrame(current: current) else { return false }
-        applyLayout(windowID: windowID, element: element, frame: frame)
-        return true
-    }
-
-    private func layoutTarget(windowID: CGWindowID, element: AXUIElement) -> (CGWindowID, AXUIElement) {
-        if let shelf = store.shelf(containing: windowID), shelf.activeWindowID != windowID,
-           let activeElement = tracker.element(of: shelf.activeWindowID) {
-            return (shelf.activeWindowID, activeElement)
-        }
-        return (windowID, element)
-    }
-
-    private func applyLayout(windowID: CGWindowID, element: AXUIElement, frame: CGRect, recordSnap: Bool = true) {
-        let (windowID, element) = layoutTarget(windowID: windowID, element: element)
-        let current = AXWindow.frame(of: element)
-
-        if recordSnap, let current {
-            let restore = snapRecords[windowID].flatMap { Self.approximatelyEqual(current, $0.snapped) ? $0.restore : nil } ?? current
-            snapRecords[windowID] = SnapRecord(restore: restore, snapped: frame)
-            pruneSnapRecords()
+    private func checkState() {
+        stateCheckScheduled = false
+        let pids = Set(store.allWindowIDs.compactMap { tracker.pid(of: $0) })
+        if pids != publishedPIDs {
+            publishedPIDs = pids
+            onShelfPIDsChanged?(pids)
         }
 
-        let shelfID = store.shelf(containing: windowID)?.id
-        let finish = { [weak self] in
-            guard let self else { return }
-            if let shelfID {
-                self.activeFrameChanged(shelfID)
-                self.placeBar(shelfID)
-            }
-            if let actual = AXWindow.frame(of: element), self.snapRecords[windowID] != nil, recordSnap {
-                self.snapRecords[windowID]?.snapped = actual
-            }
-        }
-
-        animator.cancel(windowID)
-        if AppSettings.animateWindowMove, let current, current != frame {
-            animator.animate(windowID, element: element, from: current, to: frame, completion: finish)
-        } else {
-            AXWindow.setFrame(frame, of: element)
-            finish()
-        }
-    }
-
-    private func pruneSnapRecords() {
-        guard snapRecords.count > 50 else { return }
-        let alive = Set(WindowList.describe(Array(snapRecords.keys)).map(\.id))
-        snapRecords = snapRecords.filter { alive.contains($0.key) }
-    }
-
-    private static func mergeZone(of bounds: CGRect) -> CGRect {
-        CGRect(x: bounds.minX, y: bounds.minY, width: min(110, bounds.width / 4), height: min(36, bounds.height / 6))
-    }
-
-    // MARK: - Merge / detach
-
-    private func mergeDragged(source: WindowInfo, target: WindowInfo) {
-        let sourceIsNew = store.shelf(containing: source.id) == nil
-        let targetIsNew = store.shelf(containing: target.id) == nil
-
-        guard register(windowID: source.id, pid: source.pid),
-              register(windowID: target.id, pid: target.pid),
-              let targetElement = tracker.element(of: target.id) else {
-            if sourceIsNew { release(source.id) }
-            if targetIsNew { release(target.id) }
-            return
-        }
-        if sourceIsNew {
-            originalFrames[source.id] = source.bounds
-        }
-
-        let frame = AXWindow.frame(of: targetElement) ?? target.bounds
-        let fallbacks = fallbackFrames(forShelvesOf: [source.id, target.id])
-        guard let result = store.merge(source: source.id, into: target.id) else { return }
-        reconcile(result.change, fallbacks: fallbacks, hints: [result.id: frame], focus: [result.id], animated: true)
-    }
-
-    private func detach(_ windowID: CGWindowID) {
-        guard store.shelf(containing: windowID) != nil, let pid = tracker.pid(of: windowID) else { return }
-        let fallbacks = fallbackFrames(forShelvesOf: [windowID])
-        let change = store.detach(windowID)
-        reconcile(change, fallbacks: fallbacks, hints: [:], focus: [])
-
-        guard let element = AXWindow.element(pid: pid, id: windowID) else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + WindowAnimator.duration + 0.03) {
-            AXWindow.focus(element, pid: pid)
-        }
-    }
-
-    private func removeWindows(_ gone: Set<CGWindowID>) {
-        let fallbacks = fallbackFrames(forShelvesOf: Array(gone))
-        let change = store.remove(gone)
-        for windowID in gone {
-            release(windowID)
-        }
-        reconcile(change, fallbacks: fallbacks, hints: [:], focus: [], restoreVisible: false, excluding: gone)
-    }
-
-    private func fallbackFrames(forShelvesOf windowIDs: [CGWindowID]) -> [CGWindowID: CGRect] {
-        var result: [CGWindowID: CGRect] = [:]
-        for windowID in windowIDs {
-            guard let shelf = store.shelf(containing: windowID), let frame = shelfFrames[shelf.id] else { continue }
-            for member in shelf.windowIDs {
-                result[member] = frame
-            }
-        }
-        return result
-    }
-
-    private func reconcile(
-        _ change: ShelfChange,
-        fallbacks: [CGWindowID: CGRect],
-        hints: [UUID: CGRect],
-        focus: Set<UUID>,
-        animated: Bool = false,
-        restoreVisible: Bool = true,
-        excluding gone: Set<CGWindowID> = []
-    ) {
-        for windowID in change.freed where !gone.contains(windowID) {
-            free(windowID, fallback: fallbacks[windowID], restore: restoreVisible)
-        }
-        for id in change.touched {
-            if store.shelves[id] != nil, let frame = hints[id] ?? shelfFrames[id] {
-                applyShelf(id, frame: frame, focus: focus.contains(id), animated: animated)
-            } else {
-                removeBar(id)
-                shelfFrames.removeValue(forKey: id)
-                minimizedShelves.remove(id)
-            }
-        }
-        updatePolling()
+        let hiddenIDs = Set(members.filter(\.value.hidden).map(\.key))
+        guard hiddenIDs != journaledIDs else { return }
+        journaledIDs = hiddenIDs
+        journal.update(hiddenIDs.sorted().compactMap { windowID in
+            guard let pid = tracker.pid(of: windowID),
+                  let frame = store.shelf(containing: windowID).flatMap({ shelfFrames[$0.id] }) ?? members[windowID]?.originalFrame
+            else { return nil }
+            return ParkedJournal.Entry(
+                pid: pid,
+                windowID: windowID,
+                bundleID: NSRunningApplication(processIdentifier: pid)?.bundleIdentifier,
+                restoreFrame: frame
+            )
+        })
     }
 
     // MARK: - Window state
 
-    private func register(windowID: CGWindowID, pid: pid_t) -> Bool {
+    func register(windowID: CGWindowID, pid: pid_t) -> Bool {
         guard tracker.watch(windowID: windowID, pid: pid),
               let element = tracker.element(of: windowID) else { return false }
         guard AXWindow.isStandard(element) else {
             tracker.unwatch(windowID: windowID)
             return false
         }
-        if originalFrames[windowID] == nil, let frame = AXWindow.frame(of: element) {
-            originalFrames[windowID] = frame
+        var state = members[windowID] ?? MemberState()
+        if state.originalFrame == nil {
+            state.originalFrame = AXWindow.frame(of: element)
         }
-        titles[windowID] = AXWindow.title(of: element)
+        state.title = AXWindow.title(of: element)
+        members[windowID] = state
         return true
     }
 
-    private func release(_ windowID: CGWindowID) {
+    func release(_ windowID: CGWindowID) {
         tracker.unwatch(windowID: windowID)
-        originalFrames.removeValue(forKey: windowID)
-        titles.removeValue(forKey: windowID)
-        lightsOffsets.removeValue(forKey: windowID)
-        hidden.remove(windowID)
-        parked.remove(windowID)
+        members.removeValue(forKey: windowID)
     }
 
-    private func free(_ windowID: CGWindowID, fallback: CGRect?, restore: Bool) {
+    func free(_ windowID: CGWindowID, fallback: CGRect?, restore: Bool) {
         animator.cancel(windowID)
-        if let element = tracker.element(of: windowID) {
-            let wasHidden = hidden.contains(windowID)
-            var target = originalFrames[windowID]
-            if let candidate = target, !Geometry.intersectsAnyScreen(axRect: candidate) {
-                target = nil
-            }
-            if restore || wasHidden, let target = target ?? fallback {
-                let current = parked.contains(windowID) ? fallback : AXWindow.frame(of: element)
+        if let element = tracker.element(of: windowID), let state = members[windowID] {
+            let wasHidden = state.hidden
+            let original = state.originalFrame.flatMap { Geometry.intersectsAnyScreen(axRect: $0) ? $0 : nil }
+            let parkedFallback = wasHidden ? AXWindow.frame(of: element).map(Geometry.clampedIntoVisibleScreen) : nil
+            if restore || wasHidden, let target = original ?? fallback ?? parkedFallback {
+                let current = state.parked ? fallback : AXWindow.frame(of: element)
                 let from = current ?? target
                 if wasHidden {
                     SkyLight.shared.setAlpha(0, for: windowID)
@@ -511,14 +212,13 @@ final class ShelfController: NSObject {
         release(windowID)
     }
 
-    private func hide(_ windowID: CGWindowID, frame: CGRect, animated: Bool) {
-        guard let element = tracker.element(of: windowID) else { return }
+    func hide(_ windowID: CGWindowID, frame: CGRect, animated: Bool) {
+        guard let element = tracker.element(of: windowID), let state = members[windowID] else { return }
         animator.cancel(windowID)
-        let wasVisible = !hidden.contains(windowID)
-        hidden.insert(windowID)
-        if animated, wasVisible, let current = AXWindow.frame(of: element) {
+        members[windowID]?.hidden = true
+        if animated, !state.hidden, SkyLight.shared.isAlphaSupported, let current = AXWindow.frame(of: element) {
             animator.animate(windowID, element: element, from: current, to: nil, alphaFrom: 1, alphaTo: 0) { [weak self] in
-                guard let self, self.hidden.contains(windowID) else { return }
+                guard let self, self.members[windowID]?.hidden == true else { return }
                 self.park(windowID, element: element, frame: frame)
             }
             return
@@ -526,27 +226,43 @@ final class ShelfController: NSObject {
         park(windowID, element: element, frame: frame)
     }
 
-    private func park(_ windowID: CGWindowID, element: AXUIElement, frame: CGRect) {
+    func park(_ windowID: CGWindowID, element: AXUIElement, frame: CGRect) {
+        // A minimized member stays in the Dock; show() brings it back when it is selected.
+        if AXWindow.isMinimized(element) {
+            members[windowID]?.parked = false
+            return
+        }
         if SkyLight.shared.setAlpha(0, for: windowID) {
-            parked.remove(windowID)
+            members[windowID]?.parked = false
             AXWindow.setFrame(frame, of: element)
         } else {
             let size = AXWindow.frame(of: element)?.size ?? frame.size
             AXWindow.setPosition(Geometry.hidingOrigin(for: CGRect(origin: frame.origin, size: size)), of: element)
-            parked.insert(windowID)
+            members[windowID]?.parked = true
+        }
+    }
+
+    func reparkHidden(pid: pid_t? = nil) {
+        for shelf in store.shelves.values {
+            guard let frame = shelfFrames[shelf.id] else { continue }
+            for windowID in shelf.windowIDs where windowID != shelf.activeWindowID && members[windowID]?.hidden == true {
+                guard pid == nil || tracker.pid(of: windowID) == pid, let element = tracker.element(of: windowID) else { continue }
+                animator.cancel(windowID)
+                park(windowID, element: element, frame: frame)
+            }
         }
     }
 
     @discardableResult
-    private func show(_ windowID: CGWindowID, frame: CGRect, animated: Bool, completion: (() -> Void)? = nil) -> Bool {
+    func show(_ windowID: CGWindowID, frame: CGRect, animated: Bool, completion: (() -> Void)? = nil) -> Bool {
         guard let element = tracker.element(of: windowID) else { return false }
         animator.cancel(windowID)
         if AXWindow.isMinimized(element) {
             AXWindow.setMinimized(false, of: element)
         }
-        let wasHidden = hidden.contains(windowID)
-        hidden.remove(windowID)
-        parked.remove(windowID)
+        let wasHidden = members[windowID]?.hidden ?? false
+        members[windowID]?.hidden = false
+        members[windowID]?.parked = false
 
         if animated, !wasHidden, let current = AXWindow.frame(of: element), current != frame {
             SkyLight.shared.setAlpha(1, for: windowID)
@@ -560,15 +276,25 @@ final class ShelfController: NSObject {
         return false
     }
 
-    private func focusWindow(_ windowID: CGWindowID) {
-        guard let element = tracker.element(of: windowID), let pid = tracker.pid(of: windowID) else { return }
-        AXWindow.focus(element, pid: pid)
-    }
-
-    private func applyShelf(_ id: UUID, frame: CGRect, focus: Bool, animated: Bool) {
+    func applyShelf(_ id: UUID, frame: CGRect, focus: Bool, animated: Bool) {
         guard let shelf = store.shelves[id] else { return }
         let active = shelf.activeWindowID
+        display(id, active: active, frame: frame, hiding: shelf.windowIDs.filter { $0 != active }, animated: animated, focus: focus)
+    }
 
+    func switchTo(_ windowID: CGWindowID) {
+        guard let shelf = store.shelf(containing: windowID) else { return }
+        guard shelf.activeWindowID != windowID else {
+            focusWindow(windowID)
+            return
+        }
+        let old = shelf.activeWindowID
+        guard let frame = tracker.element(of: old).flatMap({ AXWindow.frame(of: $0) }) ?? shelfFrames[shelf.id] else { return }
+        store.setActive(windowID)
+        display(shelf.id, active: windowID, frame: frame, hiding: [old], animated: false, focus: true)
+    }
+
+    private func display(_ id: UUID, active: CGWindowID, frame: CGRect, hiding: [CGWindowID], animated: Bool, focus: Bool) {
         let animating = show(active, frame: frame, animated: animated) { [weak self] in
             self?.activeFrameChanged(id)
             if focus, self?.store.shelves[id]?.activeWindowID == active {
@@ -576,7 +302,7 @@ final class ShelfController: NSObject {
                 self?.focusWindow(active)
             }
         }
-        for windowID in shelf.windowIDs where windowID != active {
+        for windowID in hiding {
             hide(windowID, frame: frame, animated: animated)
         }
         if animating {
@@ -592,40 +318,22 @@ final class ShelfController: NSObject {
 
         ignoreFocusUntil = Date().addingTimeInterval(0.4)
         refreshBar(id)
-        hiddenBars.remove(id)
         updateBarVisibility(id)
         if focus, !animating {
             focusWindow(active)
         }
     }
 
-    private func switchTo(_ windowID: CGWindowID) {
+    func focusWindow(_ windowID: CGWindowID) {
+        guard let element = tracker.element(of: windowID), let pid = tracker.pid(of: windowID) else { return }
+        AXWindow.focus(element, pid: pid)
+        // The app raises its window asynchronously after activation, which can cover the button.
         guard let shelf = store.shelf(containing: windowID) else { return }
-        guard shelf.activeWindowID != windowID else {
-            focusWindow(windowID)
-            return
+        let id = shelf.id
+        ensureTabBar(windowID, pid: pid, shelf: shelf)
+        for delay in [0.15, 0.4] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.placeBar(id) }
         }
-
-        let old = shelf.activeWindowID
-        let oldFrame = tracker.element(of: old).flatMap { AXWindow.frame(of: $0) } ?? shelfFrames[shelf.id]
-        guard let frame = oldFrame else { return }
-
-        store.setActive(windowID)
-        ignoreFocusUntil = Date().addingTimeInterval(0.4)
-        show(windowID, frame: frame, animated: false)
-        hide(old, frame: frame, animated: false)
-
-        if let element = tracker.element(of: windowID), let actual = AXWindow.frame(of: element) {
-            shelfFrames[shelf.id] = actual
-            if actual != frame {
-                scheduleSync(shelf.id, sizeChanged: true)
-            }
-        } else {
-            shelfFrames[shelf.id] = frame
-        }
-        refreshBar(shelf.id)
-        placeBar(shelf.id)
-        focusWindow(windowID)
     }
 
     // MARK: - Event handling
@@ -640,13 +348,15 @@ final class ShelfController: NSObject {
             removeWindows([windowID])
         case .titleChanged:
             if let element = tracker.element(of: windowID) {
-                titles[windowID] = AXWindow.title(of: element)
+                members[windowID]?.title = AXWindow.title(of: element)
             }
             if bars[shelf.id]?.isPopupOpen == true {
                 refreshBar(shelf.id)
             }
         case .focused:
-            if windowID != shelf.activeWindowID, Date() > ignoreFocusUntil {
+            refreshNativeTabs(windowID)
+            if windowID != shelf.activeWindowID, Date() > ignoreFocusUntil,
+               let pid = tracker.pid(of: windowID), AXWindow.focusedWindowID(pid: pid) == windowID {
                 switchTo(windowID)
             } else {
                 raiseBars()
@@ -658,7 +368,7 @@ final class ShelfController: NSObject {
     }
 
     private func minimizationChanged(_ id: UUID, _ windowID: CGWindowID) {
-        guard let shelf = store.shelves[id], let element = tracker.element(of: windowID) else { return }
+        guard !nativeMergeMinimized.contains(windowID), let shelf = store.shelves[id], let element = tracker.element(of: windowID) else { return }
         let minimized = AXWindow.isMinimized(element)
 
         if minimized, !minimizedShelves.contains(id) {
@@ -666,30 +376,30 @@ final class ShelfController: NSObject {
             for member in shelf.windowIDs where member != windowID {
                 guard let memberElement = tracker.element(of: member) else { continue }
                 animator.cancel(member)
-                if parked.contains(member), let frame = shelfFrames[id] {
+                if members[member]?.parked == true, let frame = shelfFrames[id] {
                     AXWindow.setFrame(frame, of: memberElement)
-                    parked.remove(member)
+                    members[member]?.parked = false
                 }
                 SkyLight.shared.setAlpha(1, for: member)
                 AXWindow.setMinimized(true, of: memberElement)
             }
         } else if !minimized, minimizedShelves.contains(id) {
+            // Siblings stay minimized until switched to, so they can never cover the restored tab.
             minimizedShelves.remove(id)
             store.setActive(windowID)
             for member in shelf.windowIDs where member != windowID {
-                guard let memberElement = tracker.element(of: member) else { continue }
-                SkyLight.shared.setAlpha(0, for: member)
-                hidden.insert(member)
-                AXWindow.setMinimized(false, of: memberElement)
+                members[member]?.hidden = true
+                members[member]?.parked = false
             }
-            let frame = AXWindow.frame(of: element) ?? shelfFrames[id]
-            if let frame {
+            if let frame = AXWindow.frame(of: element) ?? shelfFrames[id] {
                 applyShelf(id, frame: frame, focus: true, animated: false)
             }
+        } else if !minimized, windowID != shelf.activeWindowID, members[windowID]?.hidden == true {
+            switchTo(windowID)
         }
     }
 
-    private func activeFrameChanged(_ id: UUID) {
+    func activeFrameChanged(_ id: UUID) {
         guard let shelf = store.shelves[id],
               let element = tracker.element(of: shelf.activeWindowID),
               let frame = AXWindow.frame(of: element) else { return }
@@ -702,7 +412,7 @@ final class ShelfController: NSObject {
         scheduleSync(id, sizeChanged: previous?.size != frame.size)
     }
 
-    private func scheduleSync(_ id: UUID, sizeChanged: Bool) {
+    func scheduleSync(_ id: UUID, sizeChanged: Bool) {
         let isFirst = pendingSync.isEmpty
         pendingSync[id] = (pendingSync[id] ?? false) || sizeChanged
         guard isFirst else { return }
@@ -717,7 +427,7 @@ final class ShelfController: NSObject {
 
     private func syncSiblings(_ id: UUID, sizeChanged: Bool) {
         guard let shelf = store.shelves[id], let frame = shelfFrames[id] else { return }
-        for windowID in shelf.windowIDs where windowID != shelf.activeWindowID && !parked.contains(windowID) {
+        for windowID in shelf.windowIDs where windowID != shelf.activeWindowID && members[windowID]?.parked != true {
             guard let element = tracker.element(of: windowID) else { continue }
             if sizeChanged {
                 AXWindow.setFrame(frame, of: element)
@@ -728,7 +438,7 @@ final class ShelfController: NSObject {
     }
 
     // A backstop for missed AX notifications; only runs while shelves exist.
-    private func updatePolling() {
+    func updatePolling() {
         if store.shelves.isEmpty {
             pollTimer?.invalidate()
             pollTimer = nil
@@ -742,23 +452,23 @@ final class ShelfController: NSObject {
 
     private func refreshVisibility(full: Bool) {
         guard !store.shelves.isEmpty else { return }
-        let infos = WindowList.describe(Array(store.allWindowIDs))
-        let gone = store.allWindowIDs.subtracting(infos.map(\.id))
+        let memberIDs = store.allWindowIDs
+        let infos = WindowList.describe(Array(memberIDs))
+        let gone = memberIDs.subtracting(infos.map(\.id))
         if !gone.isEmpty {
             removeWindows(gone)
         }
-        let onScreen = Set(infos.filter(\.isOnScreen).map(\.id))
+        let screen = OnScreenWindows(memberIDs: Set(infos.filter(\.isOnScreen).map(\.id)))
         for (id, shelf) in store.shelves {
             if full {
-                updateBarVisibility(id, onScreen: onScreen)
-            } else if !onScreen.contains(shelf.activeWindowID) {
-                if !hiddenBars.contains(id) {
-                    hiddenBars.insert(id)
-                    pollHiddenBars.insert(id)
+                updateBarVisibility(id, screen: screen)
+            } else if !isShown(shelf.activeWindowID, in: screen) {
+                if barHidden[id] == nil {
+                    barHidden[id] = .poll
                     bars[id]?.hide()
                 }
-            } else if pollHiddenBars.remove(id) != nil {
-                hiddenBars.remove(id)
+            } else if barHidden[id] == .poll {
+                barHidden[id] = nil
                 placeBar(id)
             }
         }
@@ -773,166 +483,41 @@ final class ShelfController: NSObject {
     }
 
     @objc private func applicationActivated(_ notification: Notification) {
+        nativeHover.update(frontmost: notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)
         raiseBars()
+    }
+
+    @objc private func applicationHidden(_ notification: Notification) {
+        refreshVisibility(full: true)
+    }
+
+    @objc private func applicationUnhidden(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        reparkHidden(pid: app.processIdentifier)
+        refreshVisibility(full: true)
     }
 
     @objc private func spaceChanged() {
         refreshVisibility(full: true)
     }
 
-    // MARK: - Bars
-
-    private func ensureBar(_ id: UUID) -> ShelfButtonPanel {
-        if let bar = bars[id] { return bar }
-        let bar = ShelfButtonPanel(shelfID: id)
-        bar.shelfDelegate = self
-        bars[id] = bar
-        return bar
+    @objc private func screensChanged() {
+        reparkHidden()
+        refreshVisibility(full: true)
     }
 
-    private func removeBar(_ id: UUID) {
-        guard let bar = bars.removeValue(forKey: id) else { return }
-        hiddenBars.remove(id)
-        pollHiddenBars.remove(id)
-        bar.hide()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { _ = bar }
-    }
-
-    private func refreshBar(_ id: UUID) {
-        guard let shelf = store.shelves[id] else { return }
-        let bar = ensureBar(id)
-        let tabs = shelf.windowIDs.map { windowID -> TabInfo in
-            let app = tracker.pid(of: windowID).flatMap { NSRunningApplication(processIdentifier: $0) }
-            return TabInfo(
-                windowID: windowID,
-                title: titles[windowID] ?? "",
-                appName: app?.localizedName ?? "",
-                icon: app?.icon,
-                isActive: windowID == shelf.activeWindowID
-            )
-        }
-        bar.update(name: shelf.name, accent: shelf.accent.color, tabs: tabs)
-    }
-
-    // Follows the window server's bounds during a user drag; AX move notifications arrive too late.
-    private func followLiveMove(_ windowID: CGWindowID) {
-        guard let shelf = store.shelf(containing: windowID), shelf.activeWindowID == windowID,
-              let bounds = WindowList.bounds(of: windowID) else { return }
-        if liveMoveShelf == nil {
-            guard bounds != shelfFrames[shelf.id] else { return }
-            liveMoveShelf = shelf.id
-        }
-        placeBar(shelf.id, frame: bounds)
-    }
-
-    private func raiseBars() {
-        for id in bars.keys {
-            placeBar(id)
-        }
-    }
-
-    private func placeBar(_ id: UUID, frame override: CGRect? = nil) {
-        guard !hiddenBars.contains(id),
-              let shelf = store.shelves[id],
-              let bar = bars[id],
-              let frame = override ?? shelfFrames[id] else { return }
-        let active = shelf.activeWindowID
-        if lightsOffsets[active] == nil,
-           let element = tracker.element(of: active),
-           let lights = AXWindow.trafficLightsFrame(of: element),
-           let windowFrame = AXWindow.frame(of: element) {
-            lightsOffsets[active] = lights.offsetBy(dx: -windowFrame.minX, dy: -windowFrame.minY)
-        }
-        let lights = lightsOffsets[active]?.offsetBy(dx: frame.minX, dy: frame.minY)
-        bar.place(windowAXFrame: frame, trafficLights: lights, above: active)
-    }
-
-    private func updateBarVisibility(_ id: UUID, onScreen: Set<CGWindowID>? = nil) {
-        guard let shelf = store.shelves[id], let element = tracker.element(of: shelf.activeWindowID) else { return }
-        let active = shelf.activeWindowID
-        let visible = !AXWindow.isMinimized(element)
-            && !AXWindow.isFullScreen(element)
-            && (onScreen?.contains(active) ?? true)
-
-        pollHiddenBars.remove(id)
-        if visible {
-            hiddenBars.remove(id)
-            placeBar(id)
-        } else if !hiddenBars.contains(id) {
-            hiddenBars.insert(id)
-            bars[id]?.hide()
-        }
+    static func approximatelyEqual(_ a: CGRect, _ b: CGRect, tolerance: CGFloat = 2) -> Bool {
+        abs(a.minX - b.minX) <= tolerance && abs(a.minY - b.minY) <= tolerance
+            && abs(a.width - b.width) <= tolerance && abs(a.height - b.height) <= tolerance
     }
 }
 
-extension ShelfController: ShelfButtonDelegate {
-    func shelf(_ id: UUID, selectWindow windowID: CGWindowID) {
-        switchTo(windowID)
-    }
+// On-screen window ids of shelf members, plus a lazily fetched full on-screen list.
+final class OnScreenWindows {
+    let memberIDs: Set<CGWindowID>
+    private(set) lazy var all = WindowList.copy(onScreenOnly: true)
 
-    func shelf(_ id: UUID, detachWindow windowID: CGWindowID) {
-        detach(windowID)
-    }
-
-    func shelf(_ id: UUID, dropWindow windowID: CGWindowID) {
-        guard store.shelves[id] != nil,
-              let source = store.shelf(containing: windowID), source.id != id else { return }
-        let fallbacks = fallbackFrames(forShelvesOf: [windowID])
-        let change = store.move(windowID, toShelf: id)
-        reconcile(change, fallbacks: fallbacks, hints: [:], focus: [id], animated: true)
-    }
-
-    func shelfCandidateWindows(_ id: UUID) -> [CandidateWindow] {
-        let inShelves = store.allWindowIDs
-        return WindowList.copy(onScreenOnly: true).compactMap { info in
-            guard WindowList.isCandidate(info), !inShelves.contains(info.id),
-                  let element = AXWindow.element(pid: info.pid, id: info.id),
-                  AXWindow.isStandard(element) else { return nil }
-            let app = NSRunningApplication(processIdentifier: info.pid)
-            return CandidateWindow(
-                windowID: info.id,
-                title: AXWindow.title(of: element),
-                appName: app?.localizedName ?? info.ownerName,
-                icon: app?.icon
-            )
-        }
-    }
-
-    func shelf(_ id: UUID, addWindow windowID: CGWindowID) {
-        guard store.shelves[id] != nil,
-              let info = WindowList.copy(onScreenOnly: false).first(where: { $0.id == windowID }),
-              register(windowID: windowID, pid: info.pid) else { return }
-        let fallbacks = fallbackFrames(forShelvesOf: [windowID])
-        let change = store.move(windowID, toShelf: id)
-        reconcile(change, fallbacks: fallbacks, hints: [:], focus: [id], animated: true)
-    }
-
-    func shelf(_ id: UUID, renameTo name: String) {
-        store.rename(id, to: name)
-        refreshBar(id)
-        if let active = store.shelves[id]?.activeWindowID {
-            focusWindow(active)
-        }
-    }
-
-    func shelf(_ id: UUID, setAccent accent: ShelfAccent) {
-        store.setAccent(id, to: accent)
-        refreshBar(id)
-    }
-
-    func shelf(_ id: UUID, reorder windowIDs: [CGWindowID]) {
-        store.reorder(id, to: windowIDs)
-        refreshBar(id)
-    }
-
-    func shelfPopupWillOpen(_ id: UUID) {
-        refreshBar(id)
-    }
-
-    func shelfDissolve(_ id: UUID) {
-        guard let shelf = store.shelves[id] else { return }
-        let fallbacks = fallbackFrames(forShelvesOf: shelf.windowIDs)
-        let change = store.dissolve(id)
-        reconcile(change, fallbacks: fallbacks, hints: [:], focus: [])
+    init(memberIDs: Set<CGWindowID>) {
+        self.memberIDs = memberIDs
     }
 }

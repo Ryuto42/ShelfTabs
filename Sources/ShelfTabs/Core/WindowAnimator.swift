@@ -1,4 +1,5 @@
 import AppKit
+import os
 
 final class WindowAnimator: NSObject {
     static let duration: CFTimeInterval = 0.22
@@ -18,7 +19,9 @@ final class WindowAnimator: NSObject {
     }
 
     // AX writes block until the target app responds, so they run off the main thread.
+    // Each write carries the window's generation; cancel bumps it so queued stale writes are dropped.
     private let queue = DispatchQueue(label: "ShelfTabs.WindowAnimator", qos: .userInteractive)
+    private let generations = OSAllocatedUnfairLock(initialState: [CGWindowID: UInt64]())
     private var jobs: [CGWindowID: Job] = [:]
     private var inFlight: Set<CGWindowID> = []
     private var finishing: Set<CGWindowID> = []
@@ -54,17 +57,28 @@ final class WindowAnimator: NSObject {
 
     func cancel(_ windowID: CGWindowID) {
         guard jobs.removeValue(forKey: windowID) != nil || inFlight.contains(windowID) || finishing.contains(windowID) else { return }
-        queue.sync {}
+        generations.withLock { $0[windowID, default: 0] &+= 1 }
         inFlight.remove(windowID)
         finishing.remove(windowID)
     }
 
     func cancelAll() {
+        let active = Set(jobs.keys).union(inFlight).union(finishing)
         jobs.removeAll()
         stopDisplayLink()
-        queue.sync {}
+        generations.withLock { state in
+            for windowID in active { state[windowID, default: 0] &+= 1 }
+        }
         inFlight.removeAll()
         finishing.removeAll()
+    }
+
+    private func generation(of windowID: CGWindowID) -> UInt64 {
+        generations.withLock { $0[windowID] ?? 0 }
+    }
+
+    private func isCurrent(_ windowID: CGWindowID, _ generation: UInt64) -> Bool {
+        self.generation(of: windowID) == generation
     }
 
     private func stopDisplayLink() {
@@ -109,7 +123,9 @@ final class WindowAnimator: NSObject {
             if let size { jobs[windowID]?.lastSize = size }
             inFlight.insert(windowID)
             let element = job.element
+            let generation = generation(of: windowID)
             queue.async { [weak self] in
+                guard let self, self.isCurrent(windowID, generation) else { return }
                 if let movePosition {
                     AXWindow.setPosition(movePosition, of: element)
                 }
@@ -120,9 +136,10 @@ final class WindowAnimator: NSObject {
                     slow = CACurrentMediaTime() - started > Self.slowResizeThreshold
                 }
                 DispatchQueue.main.async {
-                    self?.inFlight.remove(windowID)
+                    guard self.isCurrent(windowID, generation) else { return }
+                    self.inFlight.remove(windowID)
                     if slow {
-                        self?.jobs[windowID]?.resizeIsSlow = true
+                        self.jobs[windowID]?.resizeIsSlow = true
                     }
                 }
             }
@@ -137,12 +154,14 @@ final class WindowAnimator: NSObject {
         finishing.insert(windowID)
         let element = job.element
         let to = job.to
+        let generation = generation(of: windowID)
         queue.async { [weak self] in
-            if let to {
+            guard let self else { return }
+            if let to, self.isCurrent(windowID, generation) {
                 AXWindow.setFrame(to, of: element)
             }
             DispatchQueue.main.async {
-                guard let self, self.finishing.remove(windowID) != nil else { return }
+                guard self.isCurrent(windowID, generation), self.finishing.remove(windowID) != nil else { return }
                 self.inFlight.remove(windowID)
                 job.completion?()
             }

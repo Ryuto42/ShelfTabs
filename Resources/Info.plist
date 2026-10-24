@@ -3,7 +3,12 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
-	<string>ja</string>
+	<string>en</string>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>en</string>
+		<string>ja</string>
+	</array>
 	<key>CFBundleExecutable</key>
 	<string>ShelfTabs</string>
 	<key>CFBundleIdentifier</key>
@@ -17,7 +22,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>VERSION_PLACEHOLDER</string>
 	<key>CFBundleVersion</key>
-	<string>VERSION_PLACEHOLDER</string>
+	<string>BUILD_PLACEHOLDER</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
 	<key>CFBundleIconFile</key>
@@ -26,5 +31,15 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/Ryuto42/ShelfTabs/releases/latest/download/appcast.xml</string>
+	<key>SURequireSignedFeed</key>
+	<true/>
+	<key>SUVerifyUpdateBeforeExtraction</key>
+	<true/>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUEnableSystemProfiling</key>
+	<false/>
 </dict>
 </plist>

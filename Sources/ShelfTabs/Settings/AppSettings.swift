@@ -32,10 +32,10 @@ enum ExternalDockEdge: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .bottom: "下"
-        case .left: "左"
-        case .right: "右"
-        case .top: "上"
+        case .bottom: loc("下")
+        case .left: loc("左")
+        case .right: loc("右")
+        case .top: loc("上")
         }
     }
 }
@@ -47,9 +47,9 @@ enum StyleMode: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .auto: "自動"
-        case .glass: "リキッドグラス"
-        case .solid: "単色"
+        case .auto: loc("自動")
+        case .glass: loc("リキッドグラス")
+        case .solid: loc("単色")
         }
     }
 }
@@ -61,8 +61,8 @@ enum GlassVariant: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .regular: "標準"
-        case .clear: "クリア"
+        case .regular: loc("標準")
+        case .clear: loc("クリア")
         }
     }
 }
@@ -74,9 +74,9 @@ enum ThemeMode: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .system: "システム"
-        case .light: "ライト"
-        case .dark: "ダーク"
+        case .system: loc("システム")
+        case .light: loc("ライト")
+        case .dark: loc("ダーク")
         }
     }
 
@@ -99,8 +99,13 @@ struct Shortcut {
 
     var isAssigned: Bool { keyCode >= 0 }
 
+    func matches(_ other: Shortcut) -> Bool {
+        isAssigned && keyCode == other.keyCode
+            && UInt(bitPattern: modifiers) & Self.relevantModifiers == UInt(bitPattern: other.modifiers) & Self.relevantModifiers
+    }
+
     var displayString: String {
-        guard isAssigned else { return "未設定" }
+        guard isAssigned else { return loc("未設定") }
         let flags = NSEvent.ModifierFlags(rawValue: UInt(bitPattern: modifiers))
         var result = ""
         if flags.contains(.control) { result += "⌃" }
@@ -176,6 +181,8 @@ enum AppSettings {
         static let nextTabKeyCode = "nextTabKeyCode"
         static let nextTabModifiers = "nextTabModifiers"
         static let snapEnabled = "snapEnabled"
+        static let nativeTabsForNewWindows = "nativeTabsForNewWindows"
+        static let hoverNativeTabs = "hoverNativeTabs"
         static let snapRestoreSize = "snapRestoreSize"
         static let snapHaptics = "snapHaptics"
         static let animateWindowMove = "animateWindowMove"
@@ -193,22 +200,10 @@ enum AppSettings {
     static var defaultPreviousTab: Shortcut { Shortcut(keyCode: Shortcut.keyCode(for: "[", fallback: 33), modifiers: controlOption) }
     static var defaultNextTab: Shortcut { Shortcut(keyCode: Shortcut.keyCode(for: "]", fallback: 30), modifiers: controlOption) }
 
-    private static func migrateLegacyTabShortcuts() {
-        let defaults = UserDefaults.standard
-        let legacy = [
-            (Key.previousTabKeyCode, Key.previousTabModifiers, 123),
-            (Key.nextTabKeyCode, Key.nextTabModifiers, 124),
-        ]
-        for (codeKey, modifiersKey, code) in legacy {
-            guard defaults.object(forKey: codeKey) as? Int == code,
-                  defaults.object(forKey: modifiersKey) as? Int == controlOption else { continue }
-            defaults.removeObject(forKey: codeKey)
-            defaults.removeObject(forKey: modifiersKey)
-        }
-    }
+    static let shownMarginRange: ClosedRange<Double> = 0...60
+    static let hiddenMarginRange: ClosedRange<Double> = 0...120
 
     static func registerDefaults() {
-        migrateLegacyTabShortcuts()
         var layoutDefaults: [String: Any] = [:]
         for action in LayoutAction.allCases {
             let shortcut = action.defaultShortcut
@@ -218,10 +213,11 @@ enum AppSettings {
         for area in SnapArea.allCases {
             layoutDefaults[Key.snapArea(area)] = area.defaultChoice
         }
-        UserDefaults.standard.removeObject(forKey: "externalDockEdge")
         UserDefaults.standard.register(defaults: layoutDefaults)
         UserDefaults.standard.register(defaults: [
             Key.snapEnabled: true,
+            Key.nativeTabsForNewWindows: true,
+            Key.hoverNativeTabs: true,
             Key.snapRestoreSize: true,
             Key.snapHaptics: true,
             Key.animateWindowMove: true,
@@ -265,18 +261,34 @@ enum AppSettings {
         )
     }
 
+    static func isDuplicated(_ shortcut: Shortcut) -> Bool {
+        guard shortcut.isAssigned else { return false }
+        let all = LayoutAction.allCases.map(Self.shortcut(for:)) + [previousTab, nextTab]
+        return all.filter { $0.matches(shortcut) }.count > 1
+    }
+
     static func snapChoice(for area: SnapArea) -> String {
         UserDefaults.standard.string(forKey: Key.snapArea(area)) ?? area.defaultChoice
     }
 
     static var snapEnabled: Bool { UserDefaults.standard.bool(forKey: Key.snapEnabled) }
+    static var nativeTabsForNewWindows: Bool { UserDefaults.standard.bool(forKey: Key.nativeTabsForNewWindows) }
+    static var hoverNativeTabs: Bool { UserDefaults.standard.bool(forKey: Key.hoverNativeTabs) }
     static var snapRestoreSize: Bool { UserDefaults.standard.bool(forKey: Key.snapRestoreSize) }
     static var snapHaptics: Bool { UserDefaults.standard.bool(forKey: Key.snapHaptics) }
     static var animateWindowMove: Bool { UserDefaults.standard.bool(forKey: Key.animateWindowMove) }
 
     static var externalDockBundleID: String { UserDefaults.standard.string(forKey: Key.externalDockBundleID) ?? "" }
-    static var externalDockShownMargin: CGFloat { CGFloat(UserDefaults.standard.double(forKey: Key.externalDockShownMargin)) }
-    static var externalDockHiddenMargin: CGFloat { CGFloat(UserDefaults.standard.double(forKey: Key.externalDockHiddenMargin)) }
+    static var externalDockShownMargin: CGFloat {
+        CGFloat(clamped(UserDefaults.standard.double(forKey: Key.externalDockShownMargin), to: shownMarginRange))
+    }
+    static var externalDockHiddenMargin: CGFloat {
+        CGFloat(clamped(UserDefaults.standard.double(forKey: Key.externalDockHiddenMargin), to: hiddenMarginRange))
+    }
+
+    static func clamped(_ value: Double, to range: ClosedRange<Double>) -> Double {
+        value.isFinite ? min(max(value, range.lowerBound), range.upperBound) : range.lowerBound
+    }
 
     private static func raw<T: RawRepresentable>(_ key: String, default fallback: T) -> T where T.RawValue == String {
         UserDefaults.standard.string(forKey: key).flatMap(T.init(rawValue:)) ?? fallback

@@ -21,9 +21,46 @@ enum BarStyle: Equatable {
     }
 }
 
+extension Notification.Name {
+    static let shelfStyleDidChange = Notification.Name("ShelfTabs.styleDidChange")
+}
+
+// Turns the many UserDefaults / accessibility notifications into one style-change notification.
+enum StyleCenter {
+    private struct Snapshot: Equatable {
+        let style: BarStyle
+        let theme: ThemeMode
+    }
+
+    private static var tokens: [NSObjectProtocol] = []
+    private static var last: Snapshot?
+
+    static func start() {
+        guard tokens.isEmpty else { return }
+        last = current()
+        tokens = [
+            NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { _ in check() },
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
+            ) { _ in check() },
+        ]
+    }
+
+    private static func current() -> Snapshot {
+        Snapshot(style: BarStyle.resolve(), theme: AppSettings.themeMode)
+    }
+
+    private static func check() {
+        let snapshot = current()
+        guard snapshot != last else { return }
+        last = snapshot
+        NotificationCenter.default.post(name: .shelfStyleDidChange, object: nil)
+    }
+}
+
 extension NSView {
-    var isDarkAppearance: Bool {
-        effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    func addHoverTrackingArea() {
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
     }
 
     func resolvedCGColor(_ color: NSColor) -> CGColor {

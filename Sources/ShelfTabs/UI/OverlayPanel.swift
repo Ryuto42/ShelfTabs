@@ -1,7 +1,7 @@
 import AppKit
 
 class OverlayPanel: NSPanel {
-    private var fadingOut = false
+    private(set) var isFadingOut = false
 
     init(size: NSSize, level: NSWindow.Level) {
         super.init(
@@ -26,11 +26,11 @@ class OverlayPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 
     func present(duration: TimeInterval = 0.2, order: () -> Void) {
-        let appearing = !isVisible || fadingOut
+        let appearing = !isVisible || isFadingOut
         if !isVisible {
             alphaValue = 0
         }
-        fadingOut = false
+        isFadingOut = false
         order()
         if appearing {
             NSAnimationContext.runAnimationGroup { context in
@@ -41,14 +41,15 @@ class OverlayPanel: NSPanel {
     }
 
     func dismiss(duration: TimeInterval = 0.15, completion: (() -> Void)? = nil) {
-        guard isVisible, !fadingOut else { return }
-        fadingOut = true
+        guard isVisible, !isFadingOut else { return }
+        isFadingOut = true
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = duration
             animator().alphaValue = 0
-        }, completionHandler: { [weak self] in
-            guard let self, self.fadingOut else { return }
-            self.fadingOut = false
+        }, completionHandler: { [self] in
+            // Holding self keeps a panel that was just discarded alive until it is ordered out.
+            guard self.isFadingOut else { return }
+            self.isFadingOut = false
             self.orderOut(nil)
             completion?()
         })
