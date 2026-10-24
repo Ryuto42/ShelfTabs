@@ -93,9 +93,12 @@ final class ShelfButtonView: NSView {
             let glass = NSGlassEffectView()
             glass.cornerRadius = radius
             glass.style = .clear
+            // effectIsInteractive exists only in the macOS 27 SDK (Xcode 27 / Swift 6.4).
+            #if compiler(>=6.4)
             if #available(macOS 27, *) {
                 glass.effectIsInteractive = true
             }
+            #endif
             newPill = glass
         case .solid:
             newPill = NSView()
