@@ -30,7 +30,7 @@ if [[ -n "${NOTARY_PROFILE:-}" ]]; then
   xcrun stapler staple "$APP"
   rm dist/notarize.zip
 else
-  echo "warning: 公証していないビルドです。初回起動時に「右クリック → 開く」が必要になります" >&2
+  echo "warning: 公証していないビルドです。初回起動時に「システム設定 → プライバシーとセキュリティ → このまま開く」が必要になります" >&2
 fi
 
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
